@@ -26,8 +26,8 @@ import { TableObjectRenderer } from '@/engine/table-object-renderer';
 import { TableResizeRenderer } from '@/engine/table-resize-renderer';
 import { Ruler } from '@/view/ruler';
 
-const wasm = new WasmBridge();
-const eventBus = new EventBus();
+export const wasm = new WasmBridge();
+export const eventBus = new EventBus();
 
 // E2E 테스트용 전역 노출 (개발 모드 전용)
 if (import.meta.env.DEV) {
@@ -661,3 +661,7 @@ window.addEventListener('message', async (e) => {
     reply(undefined, err.message || String(err));
   }
 });
+
+// HTATIS bridge hook — adds postMessage methods for host app integration.
+// See rhwp-api-bridge.ts for details.
+import './rhwp-api-bridge';
