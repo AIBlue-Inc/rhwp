@@ -15,19 +15,33 @@ import { wasm, eventBus } from './main';
 
 const METHODS = new Set(['exportHwp', 'exportHwpx', 'subscribeChange']);
 
-// Same-origin by default; extend if the host app lives on a different origin.
-function isOriginAllowed(origin: string): boolean {
-  if (origin === window.location.origin) return true;
-  if (origin === 'null') return false; // sandboxed frames
-  try {
-    const u = new URL(origin);
-    // Dev convenience: allow localhost on any port (Vite 3100, etc.)
-    if (u.hostname === 'localhost' || u.hostname === '127.0.0.1') return true;
-  } catch {
-    /* malformed origin */
-  }
-  return false;
+// Origin policy: same-origin only by default. Additional origins can be
+// whitelisted at build time via a Vite define (e.g. VITE_RHWP_ALLOWED_ORIGINS
+// as a comma-separated list). We intentionally do NOT auto-allow localhost
+// ports in production — that was flagged in the Stage 1 codex review as a
+// needless attack surface.
+declare const __RHWP_EXTRA_ORIGINS__: string | undefined;
+
+function loadAllowedOrigins(): Set<string> {
+  const extra = typeof __RHWP_EXTRA_ORIGINS__ === 'string' ? __RHWP_EXTRA_ORIGINS__ : '';
+  return new Set(
+    [window.location.origin, ...extra.split(',').map((s) => s.trim())].filter(Boolean),
+  );
 }
+
+const ALLOWED_ORIGINS = loadAllowedOrigins();
+
+function isOriginAllowed(origin: string): boolean {
+  if (origin === 'null') return false; // sandboxed frames
+  return ALLOWED_ORIGINS.has(origin);
+}
+
+// Per-source subscription cleanup. Each window that calls `subscribeChange`
+// gets exactly one listener; unsubscribe runs when the source is GC'd
+// (detected lazily when postMessage fails) or when a second subscribe
+// arrives from the same source (we treat it as an idempotent re-subscribe).
+type Unsubscribe = () => void;
+const subscriptions = new WeakMap<Window, Unsubscribe>();
 
 window.addEventListener('message', (e: MessageEvent) => {
   const msg = e.data;
@@ -37,13 +51,17 @@ window.addEventListener('message', (e: MessageEvent) => {
   if (!isOriginAllowed(e.origin)) return;
 
   const { id, method } = msg as { id: number; method: string };
+  const source = e.source as Window | null;
   const reply = (result?: unknown, error?: string) => {
-    const source = e.source as Window | null;
     if (!source) return;
-    source.postMessage(
-      { type: 'rhwp-response', id, result, error },
-      { targetOrigin: e.origin },
-    );
+    try {
+      source.postMessage(
+        { type: 'rhwp-response', id, result, error },
+        { targetOrigin: e.origin },
+      );
+    } catch {
+      /* source closed */
+    }
   };
 
   try {
@@ -54,9 +72,7 @@ window.addEventListener('message', (e: MessageEvent) => {
         break;
       }
       case 'exportHwpx': {
-        // Some rhwp versions may not implement hwpx export yet.
-        const fn = (wasm as unknown as { exportHwpx?: () => Uint8Array })
-          .exportHwpx;
+        const fn = (wasm as unknown as { exportHwpx?: () => Uint8Array }).exportHwpx;
         if (typeof fn !== 'function') {
           reply(undefined, 'exportHwpx not supported by this rhwp build');
           break;
@@ -65,22 +81,39 @@ window.addEventListener('message', (e: MessageEvent) => {
         break;
       }
       case 'subscribeChange': {
-        const source = e.source as Window | null;
         if (!source) {
           reply(undefined, 'no source window');
           break;
         }
+        // Idempotent: if this source already subscribed, drop the old one
+        // before registering a new handler. Prevents duplicate events on
+        // re-mount.
+        subscriptions.get(source)?.();
+
         const origin = e.origin;
-        eventBus.on('document-changed', () => {
+        const handler = () => {
           try {
             source.postMessage(
               { type: 'rhwp-event', event: 'document-changed' },
               { targetOrigin: origin },
             );
           } catch {
-            /* source closed */
+            // Source closed — clean up and stop notifying.
+            subscriptions.get(source)?.();
+            subscriptions.delete(source);
           }
-        });
+        };
+        const unsubscribe = eventBus.on('document-changed', handler) as Unsubscribe | void;
+        // Fallback if EventBus.on does not return an unsubscribe function.
+        const cleanup: Unsubscribe =
+          typeof unsubscribe === 'function'
+            ? unsubscribe
+            : () => {
+                const off = (eventBus as unknown as { off?: (ev: string, h: Function) => void })
+                  .off;
+                off?.call(eventBus, 'document-changed', handler);
+              };
+        subscriptions.set(source, cleanup);
         reply(true);
         break;
       }
