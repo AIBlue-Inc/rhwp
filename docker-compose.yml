@@ -42,6 +42,23 @@ services:
     working_dir: /app
     command: wasm-pack build --target web
 
+  # HTATIS Stage 2 Track B: Node.js target build for server-side rhwp worker
+  # Output: pkg-node/ (commonjs modules consumable by `require()`)
+  wasm-node:
+    build:
+      context: .
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    env_file: .env.docker
+    volumes:
+      - .:/app
+      - cargo-cache:/home/builder/.cargo/registry
+      - cargo-bin:/home/builder/.cargo/bin
+      - wasm-pack-cache:/home/builder/.cache/.wasm-pack
+    working_dir: /app
+    command: wasm-pack build --target nodejs --out-dir pkg-node
+
 volumes:
   cargo-cache:
   cargo-bin:
