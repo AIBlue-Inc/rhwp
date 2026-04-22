@@ -23,6 +23,8 @@ const METHODS = new Set([
   'saveSnapshot', 'restoreSnapshot', 'discardSnapshot',
   // studio-layer helpers (PoC)
   'setReadOnly', 'highlightCell', 'scrollToCell',
+  // introspection for LLM editing pipeline (HTATIS spike)
+  'getPageTextLayout', 'getPageControlLayout', 'getDocumentInfo',
 ]);
 
 declare const __RHWP_EXTRA_ORIGINS__: string | undefined;
@@ -413,6 +415,22 @@ window.addEventListener('message', async (e: MessageEvent) => {
       case 'getPageSvg': {
         const page = (p.page as number | undefined) ?? 0;
         reply(wasm.renderPageSvg(page));
+        break;
+      }
+
+      // ───── Introspection for LLM editing pipeline (HTATIS spike) ─────
+      case 'getPageTextLayout': {
+        const page = (p.page as number | undefined) ?? 0;
+        reply(wasm.getPageTextLayout(page));
+        break;
+      }
+      case 'getPageControlLayout': {
+        const page = (p.page as number | undefined) ?? 0;
+        reply(wasm.getPageControlLayout(page));
+        break;
+      }
+      case 'getDocumentInfo': {
+        reply(wasm.getDocumentInfoJSON());
         break;
       }
 

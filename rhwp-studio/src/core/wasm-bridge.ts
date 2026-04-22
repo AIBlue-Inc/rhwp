@@ -533,6 +533,17 @@ export class WasmBridge {
     return JSON.parse(this.doc.insertPicture(sec, paraIdx, charOffset, imageData, width, height, naturalWidthPx, naturalHeightPx, extension, description));
   }
 
+  // ── 문서 introspection API (HTATIS LLM editing pipeline) ──
+  getPageTextLayout(pageNum: number): unknown {
+    if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+    return JSON.parse(this.doc.getPageTextLayout(pageNum));
+  }
+
+  getDocumentInfoJSON(): unknown {
+    if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+    return JSON.parse(this.doc.getDocumentInfo());
+  }
+
   // ── 그림 속성 API ─────────────────────────────────────
   getPageControlLayout(pageNum: number): { controls: import('./types').ControlLayoutItem[] } {
     if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
