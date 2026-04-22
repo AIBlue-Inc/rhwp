@@ -402,8 +402,26 @@ function setupEventListeners(): void {
   });
 }
 
+/**
+ * 외부(예: HTATIS bridge) 에서 문서 변경 이후 캔버스를 즉시 재렌더할 때 사용.
+ * - insertTextInCell 등 cell-mutation 배치가 종료된 후 호출하면,
+ *   canvas-view 가 새 페이지 정보를 재수집하고 보이는 페이지를 다시 그린다.
+ */
+export function refreshDocumentView(): void {
+  canvasView?.refreshPages();
+}
+
+/** HTATIS bridge 가 셀 bbox → 스크롤 좌표 변환을 위해 canvasView 에 접근. */
+export function getCanvasView(): CanvasView | null {
+  return canvasView;
+}
+
 /** 문서 초기화 공통 시퀀스 (loadFile, createNewDocument 양쪽에서 사용) */
-async function initializeDocument(docInfo: DocumentInfo, displayName: string): Promise<void> {
+export async function initializeDocument(
+  docInfo: DocumentInfo,
+  displayName: string,
+  options?: { skipValidationModal?: boolean },
+): Promise<void> {
   const msg = sbMessage();
   try {
     console.log('[initDoc] 1. 폰트 로딩 시작');
@@ -429,22 +447,38 @@ async function initializeDocument(docInfo: DocumentInfo, displayName: string): P
     console.log('[initDoc] 8. 완료');
 
     // #177: HWPX 비표준 lineseg 감지 → 경고 있으면 모달로 사용자 선택 요청
-    try {
-      const report = wasm.getValidationWarnings();
-      console.log(`[validation] ${report.count} warnings`, report.summary);
-      if (report.count > 0) {
-        const choice = await showValidationModalIfNeeded(report);
-        console.log(`[validation] user choice: ${choice}`);
-        if (choice === 'auto-fix') {
-          const n = wasm.reflowLinesegs();
-          console.log(`[validation] reflowed ${n} paragraphs`);
-          // 렌더 재계산
-          canvasView?.loadDocument();
-          msg.textContent = `${displayName} (비표준 lineseg ${n}건 자동 보정됨)`;
+    // HTATIS PoC (`/poc/ai-live`) 에서는 skipValidationModal=true 로 호출되어
+    // 경고 모달이 사용자 입력을 기다리며 loadFile 응답을 블록킹하지 않는다.
+    if (options?.skipValidationModal) {
+      try {
+        const report = wasm.getValidationWarnings();
+        if (report.count > 0) {
+          console.warn(
+            `[validation] ${report.count} warnings — 모달 억제(skipValidationModal).`,
+            report.summary,
+          );
         }
+      } catch (e) {
+        console.warn('[validation] 감지 실패 (치명적이지 않음):', e);
       }
-    } catch (e) {
-      console.warn('[validation] 감지/보정 실패 (치명적이지 않음):', e);
+    } else {
+      try {
+        const report = wasm.getValidationWarnings();
+        console.log(`[validation] ${report.count} warnings`, report.summary);
+        if (report.count > 0) {
+          const choice = await showValidationModalIfNeeded(report);
+          console.log(`[validation] user choice: ${choice}`);
+          if (choice === 'auto-fix') {
+            const n = wasm.reflowLinesegs();
+            console.log(`[validation] reflowed ${n} paragraphs`);
+            // 렌더 재계산
+            canvasView?.loadDocument();
+            msg.textContent = `${displayName} (비표준 lineseg ${n}건 자동 보정됨)`;
+          }
+        }
+      } catch (e) {
+        console.warn('[validation] 감지/보정 실패 (치명적이지 않음):', e);
+      }
     }
   } catch (error) {
     console.error('[initDoc] 오류:', error);
@@ -605,63 +639,9 @@ function showLoadError(error: unknown): void {
 
 initialize();
 
-// ── iframe 연동 API (postMessage) ──
-// 부모 페이지에서 postMessage로 에디터를 제어할 수 있다.
-// 요청: { type: 'rhwp-request', id, method, params }
-// 응답: { type: 'rhwp-response', id, result?, error? }
-window.addEventListener('message', async (e) => {
-  const msg = e.data;
-  if (!msg || typeof msg !== 'object') return;
-
-  // 기존 hwpctl-load 호환
-  if (msg.type === 'hwpctl-load' && msg.data) {
-    try {
-      const bytes = new Uint8Array(msg.data);
-      const docInfo = wasm.loadDocument(bytes, msg.fileName || 'document.hwp');
-      await initializeDocument(docInfo, `${msg.fileName || 'document'} — ${docInfo.pageCount}페이지`);
-      e.source?.postMessage({ type: 'rhwp-response', id: msg.id, result: { pageCount: docInfo.pageCount } }, { targetOrigin: '*' });
-    } catch (err: any) {
-      e.source?.postMessage({ type: 'rhwp-response', id: msg.id, error: err.message || String(err) }, { targetOrigin: '*' });
-    }
-    return;
-  }
-
-  // rhwp-request: 범용 API
-  if (msg.type !== 'rhwp-request' || !msg.method) return;
-  const { id, method, params } = msg;
-  const reply = (result?: any, error?: string) => {
-    e.source?.postMessage({ type: 'rhwp-response', id, result, error }, { targetOrigin: '*' });
-  };
-
-  try {
-    switch (method) {
-      case 'loadFile': {
-        const bytes = new Uint8Array(params.data);
-        const docInfo = wasm.loadDocument(bytes, params.fileName || 'document.hwp');
-        await initializeDocument(docInfo, `${params.fileName || 'document'} — ${docInfo.pageCount}페이지`);
-        reply({ pageCount: docInfo.pageCount });
-        break;
-      }
-      case 'pageCount':
-        reply(wasm.pageCount);
-        break;
-      case 'getPageSvg':
-        reply(wasm.renderPageSvg(params.page ?? 0));
-        break;
-      case 'exportHwp':
-        reply(Array.from(wasm.exportHwp()));
-        break;
-      case 'ready':
-        reply(true);
-        break;
-      default:
-        reply(undefined, `Unknown method: ${method}`);
-    }
-  } catch (err: any) {
-    reply(undefined, err.message || String(err));
-  }
-});
-
-// HTATIS bridge hook — adds postMessage methods for host app integration.
-// See rhwp-api-bridge.ts for details.
+// HTATIS bridge — unified postMessage dispatcher (origin-checked).
+// All `rhwp-request` methods (including loadFile/pageCount/getPageSvg/ready/
+// exportHwp) are handled in rhwp-api-bridge.ts. The legacy unchecked default
+// handler that previously lived here was removed as part of the Stage 2c
+// security hardening — see docs §5.1.
 import './rhwp-api-bridge';
