@@ -33,6 +33,8 @@ const METHODS = new Set([
   'setReadOnly', 'highlightCell', 'scrollToCell',
   // introspection for LLM editing pipeline (HTATIS spike)
   'getPageTextLayout', 'getPageControlLayout', 'getDocumentInfo',
+  // canonical server operation batch preview (PR-12)
+  'applyOperationBatch', 'readTargets',
 ]);
 
 declare const __RHWP_EXTRA_ORIGINS__: string | undefined;
@@ -174,6 +176,366 @@ function enqueueMutation(fn: MutationFn, reply: (r?: unknown, e?: string) => voi
   } else {
     scheduleFlush();
   }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Canonical operation batch preview (PR-12).
+//
+// Keep this adapter in lock-step with rhwp_node/worker.cjs. The worker's
+// flat operation contract is the source of truth; WasmBridge is used only
+// through signatures that exist in core/wasm-bridge.ts.
+// ─────────────────────────────────────────────────────────────
+type FlatOperation = Record<string, unknown>;
+type OperationStatus = 'APPLIED' | 'FAILED' | 'SKIPPED';
+
+interface AppliedOperation {
+  op_index: number;
+  status: OperationStatus;
+  error?: string;
+}
+
+interface OperationBatchResult {
+  ok: boolean;
+  applied: AppliedOperation[];
+  warnings: string[];
+}
+
+type CellCoordinates = Map<string, number[]>;
+
+const STRUCTURE_OPERATIONS = new Set([
+  'insertTableRow',
+  'deleteTableRow',
+  'mergeTableCells',
+]);
+
+function operationError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function requestedOpIndex(operation: FlatOperation, fallback: number): number {
+  return typeof operation.op_index === 'number' ? operation.op_index : fallback;
+}
+
+function positiveCount(operation: FlatOperation, tag: string): number {
+  const count = operation.count === undefined ? 1 : operation.count;
+  if (typeof count !== 'number' || !Number.isInteger(count) || count < 1) {
+    throw new Error(`${tag} count must be a positive integer`);
+  }
+  return count;
+}
+
+function parseOkResult(raw: string, label: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`${label} returned invalid JSON: ${operationError(error)}`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`${label} returned non-object JSON`);
+  }
+  if ((parsed as { ok?: unknown }).ok !== true) {
+    throw new Error(`${label} failed: ${raw}`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function requireOkResult<T extends { ok: boolean }>(result: T, label: string): T {
+  if (result.ok !== true) throw new Error(`${label} failed`);
+  return result;
+}
+
+function createCellIndexResolver() {
+  const cache = new Map<string, CellCoordinates>();
+  const tableKey = (sec: number, para: number, ci: number) => `${sec}:${para}:${ci}`;
+  const coordinateKey = (row: number, col: number) => `${row}:${col}`;
+
+  function build(sec: number, para: number, ci: number): CellCoordinates {
+    const dimensions = wasm.getTableDimensions(sec, para, ci);
+    const coordinates: CellCoordinates = new Map();
+    for (let cellIndex = 0; cellIndex < dimensions.cellCount; cellIndex++) {
+      const info = wasm.getCellInfo(sec, para, ci, cellIndex);
+      if (!Number.isInteger(info.row) || !Number.isInteger(info.col)) continue;
+      const key = coordinateKey(info.row, info.col);
+      const matches = coordinates.get(key) ?? [];
+      matches.push(cellIndex);
+      coordinates.set(key, matches);
+    }
+    cache.set(tableKey(sec, para, ci), coordinates);
+    return coordinates;
+  }
+
+  return {
+    resolve(sec: number, para: number, ci: number, row: number, col: number): number {
+      const key = tableKey(sec, para, ci);
+      const coordinates = cache.get(key) ?? build(sec, para, ci);
+      const matches = coordinates.get(coordinateKey(row, col)) ?? [];
+      if (matches.length !== 1) throw new Error('cell_not_found_by_row_col');
+      return matches[0];
+    },
+    invalidate(sec: number, para: number, ci: number): void {
+      cache.delete(tableKey(sec, para, ci));
+    },
+  };
+}
+
+type CellIndexResolver = ReturnType<typeof createCellIndexResolver>;
+
+function resolveOperationCellIndex(
+  operation: FlatOperation,
+  resolver: CellIndexResolver,
+  indexKey = 'cell_index',
+): number {
+  const cellIndex = operation[indexKey];
+  if (typeof cellIndex === 'number' && Number.isInteger(cellIndex) && cellIndex >= 0) {
+    return cellIndex;
+  }
+  const { sec, para, ci, row, col } = operation;
+  if (
+    typeof row === 'number' && Number.isInteger(row) && row >= 0
+    && typeof col === 'number' && Number.isInteger(col) && col >= 0
+  ) {
+    return resolver.resolve(sec as number, para as number, ci as number, row, col);
+  }
+  throw new Error('cell_not_found_by_row_col');
+}
+
+function applyOperation(
+  operation: FlatOperation,
+  tag: string,
+  warnings: string[],
+  cellIndexResolver: CellIndexResolver,
+): void {
+  const op = operation.op;
+  const sec = operation.sec as number;
+  const para = operation.para as number;
+  const ci = operation.ci as number;
+
+  if (op === 'setCellText') {
+    const cellIndex = resolveOperationCellIndex(operation, cellIndexResolver);
+    const paragraphCount = wasm.getCellParagraphCount(sec, para, ci, cellIndex);
+    if (paragraphCount > 1) {
+      warnings.push(`${tag} setCellText replaced paragraph 0 only (${paragraphCount} paragraphs)`);
+    }
+    const length = wasm.getCellParagraphLength(sec, para, ci, cellIndex, 0);
+    parseOkResult(
+      wasm.deleteTextInCell(sec, para, ci, cellIndex, 0, 0, length),
+      `${tag} deleteTextInCell`,
+    );
+    parseOkResult(
+      wasm.insertTextInCell(sec, para, ci, cellIndex, 0, 0, String(operation.text ?? '')),
+      `${tag} insertTextInCell`,
+    );
+    return;
+  }
+
+  if (op === 'replaceTextInCell') {
+    const cellIndex = resolveOperationCellIndex(operation, cellIndexResolver);
+    const cellParaIdx = operation.cell_para_idx as number;
+    const charOffset = operation.char_offset as number;
+    const length = operation.length as number;
+    parseOkResult(
+      wasm.deleteTextInCell(sec, para, ci, cellIndex, cellParaIdx, charOffset, length),
+      `${tag} deleteTextInCell`,
+    );
+    parseOkResult(
+      wasm.insertTextInCell(
+        sec,
+        para,
+        ci,
+        cellIndex,
+        cellParaIdx,
+        charOffset,
+        String(operation.text ?? ''),
+      ),
+      `${tag} insertTextInCell`,
+    );
+    return;
+  }
+
+  if (op === 'insertTableRow') {
+    if (typeof operation.below !== 'boolean') {
+      throw new Error(`${tag} below must be boolean`);
+    }
+    const count = positiveCount(operation, tag);
+    for (let n = 0; n < count; n++) {
+      requireOkResult(
+        wasm.insertTableRow(sec, para, ci, operation.row_idx as number, operation.below),
+        `${tag} insertTableRow`,
+      );
+    }
+    return;
+  }
+
+  if (op === 'deleteTableRow') {
+    const rowIdx = operation.row_idx as number;
+    const count = positiveCount(operation, tag);
+    for (let index = rowIdx + count - 1; index >= rowIdx; index--) {
+      requireOkResult(wasm.deleteTableRow(sec, para, ci, index), `${tag} deleteTableRow`);
+    }
+    return;
+  }
+
+  if (op === 'mergeTableCells') {
+    requireOkResult(
+      wasm.mergeTableCells(
+        sec,
+        para,
+        ci,
+        operation.start_row as number,
+        operation.start_col as number,
+        operation.end_row as number,
+        operation.end_col as number,
+      ),
+      `${tag} mergeTableCells`,
+    );
+    return;
+  }
+
+  if (op === 'copyCellFormat') {
+    const sourceCellIndex = operation.source_cell_index as number;
+    const targetCellIndex = resolveOperationCellIndex(
+      operation,
+      cellIndexResolver,
+      'target_cell_index',
+    );
+    const sourceProperties = wasm.getCellProperties(sec, para, ci, sourceCellIndex);
+    requireOkResult(
+      wasm.setCellProperties(sec, para, ci, targetCellIndex, sourceProperties),
+      `${tag} setCellProperties`,
+    );
+    return;
+  }
+
+  if (op === 'setFieldValueByName') {
+    requireOkResult(
+      wasm.setFieldValueByName(operation.field_name as string, String(operation.text ?? '')),
+      `${tag} setFieldValueByName`,
+    );
+    return;
+  }
+
+  throw new Error(`${tag} unsupported op: ${String(op)}`);
+}
+
+function applyOperationBatch(operations: unknown): OperationBatchResult {
+  const applied: AppliedOperation[] = [];
+  const warnings: string[] = [];
+  if (!Array.isArray(operations)) {
+    return { ok: false, applied, warnings: ['operations must be an array'] };
+  }
+  if (explicitBatchOpen) {
+    return { ok: false, applied, warnings: ['applyOperationBatch cannot run inside an explicit batch'] };
+  }
+
+  flushPendingNow();
+  const doc = rawDoc();
+  if (!doc) return { ok: false, applied, warnings: ['document is not loaded'] };
+
+  const cellIndexResolver = createCellIndexResolver();
+  let structureFailed = false;
+  let batchFailed = false;
+  try {
+    doc.beginBatch();
+  } catch (error) {
+    return { ok: false, applied, warnings: [`beginBatch threw: ${operationError(error)}`] };
+  }
+
+  try {
+    for (let index = 0; index < operations.length; index++) {
+      const operation = operations[index] && typeof operations[index] === 'object'
+        ? operations[index] as FlatOperation
+        : {};
+      const opIndex = requestedOpIndex(operation, index);
+      const op = typeof operation.op === 'string' ? operation.op : '';
+      const tag = `operations[${index}]`;
+
+      if (structureFailed) {
+        applied.push({
+          op_index: opIndex,
+          status: 'SKIPPED',
+          error: 'skipped_after_structure_failure',
+        });
+        continue;
+      }
+
+      try {
+        applyOperation(operation, tag, warnings, cellIndexResolver);
+        if (STRUCTURE_OPERATIONS.has(op)) {
+          cellIndexResolver.invalidate(
+            operation.sec as number,
+            operation.para as number,
+            operation.ci as number,
+          );
+        }
+        applied.push({ op_index: opIndex, status: 'APPLIED' });
+      } catch (error) {
+        applied.push({ op_index: opIndex, status: 'FAILED', error: operationError(error) });
+        if (STRUCTURE_OPERATIONS.has(op)) structureFailed = true;
+      }
+    }
+  } finally {
+    try {
+      doc.endBatch();
+    } catch (error) {
+      batchFailed = true;
+      warnings.push(`endBatch threw: ${operationError(error)}`);
+    }
+  }
+
+  try {
+    refreshDocumentView();
+  } catch (error) {
+    warnings.push(`refreshDocumentView failed: ${operationError(error)}`);
+  }
+  try {
+    eventBus.emit('document-changed');
+  } catch (error) {
+    warnings.push(`document-changed notification failed: ${operationError(error)}`);
+  }
+
+  const operationFailed = applied.some((item) => item.status !== 'APPLIED');
+  return { ok: !batchFailed && !operationFailed, applied, warnings };
+}
+
+function readTargets(targets: unknown): { ok: true; targets: FlatOperation[] } {
+  if (!Array.isArray(targets)) throw new Error('targets must be an array');
+  flushPendingNow();
+  const result: FlatOperation[] = [];
+  const cellIndexResolver = createCellIndexResolver();
+
+  for (let index = 0; index < targets.length; index++) {
+    const target = targets[index] && typeof targets[index] === 'object'
+      ? targets[index] as FlatOperation
+      : {};
+    const sec = target.sec as number;
+    const para = target.para as number;
+    const ci = target.ci as number;
+    if (target.kind === 'cell') {
+      const cellIndex = resolveOperationCellIndex(target, cellIndexResolver);
+      const paragraphCount = wasm.getCellParagraphCount(sec, para, ci, cellIndex);
+      const paragraphs: string[] = [];
+      for (let cellParaIdx = 0; cellParaIdx < paragraphCount; cellParaIdx++) {
+        const length = wasm.getCellParagraphLength(sec, para, ci, cellIndex, cellParaIdx);
+        paragraphs.push(
+          length > 0
+            ? wasm.getTextInCell(sec, para, ci, cellIndex, cellParaIdx, 0, length) || ''
+            : '',
+        );
+      }
+      result.push({ ...target, text: paragraphs.join('\n') });
+    } else if (target.kind === 'table') {
+      const dimensions = wasm.getTableDimensions(sec, para, ci);
+      result.push({
+        ...target,
+        row_count: dimensions.rowCount,
+        col_count: dimensions.colCount,
+      });
+    } else {
+      throw new Error(`targets[${index}] unsupported kind: ${String(target.kind)}`);
+    }
+  }
+  return { ok: true, targets: result };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -439,6 +801,14 @@ window.addEventListener('message', async (e: MessageEvent) => {
       }
       case 'getDocumentInfo': {
         reply(wasm.getDocumentInfoJSON());
+        break;
+      }
+      case 'applyOperationBatch': {
+        reply(applyOperationBatch(p.operations));
+        break;
+      }
+      case 'readTargets': {
+        reply(readTargets(p.targets));
         break;
       }
 
