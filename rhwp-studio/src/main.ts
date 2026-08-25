@@ -416,6 +416,11 @@ export function getCanvasView(): CanvasView | null {
   return canvasView;
 }
 
+/** HTATIS bridge 가 현재 편집 위치에서 studio 작업을 실행하기 위해 inputHandler 에 접근. */
+export function getInputHandler(): InputHandler | null {
+  return inputHandler;
+}
+
 /** 문서 초기화 공통 시퀀스 (loadFile, createNewDocument 양쪽에서 사용) */
 export async function initializeDocument(
   docInfo: DocumentInfo,

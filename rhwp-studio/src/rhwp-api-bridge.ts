@@ -8,7 +8,14 @@
  *
  * All methods are gated by the origin allowlist. No second listener exists.
  */
-import { wasm, eventBus, initializeDocument, refreshDocumentView, getCanvasView } from './main';
+import {
+  wasm,
+  eventBus,
+  initializeDocument,
+  refreshDocumentView,
+  getCanvasView,
+  getInputHandler,
+} from './main';
 
 const METHODS = new Set([
   // export + events (existing)
@@ -17,6 +24,7 @@ const METHODS = new Set([
   'loadFile', 'pageCount', 'getPageSvg', 'ready',
   // cell mutations (PoC)
   'insertTextInCell', 'deleteTextInCell', 'setFieldValueByName', 'replaceText',
+  'insertPictureAtCursor',
   // explicit batching (PoC)
   'beginBatch', 'endBatch',
   // snapshots (PoC, name→id mapped internally)
@@ -530,6 +538,98 @@ window.addEventListener('message', async (e: MessageEvent) => {
           wasm.replaceText(sec, para, charOffset, length, value);
           return { ok: true };
         }, reply);
+        break;
+      }
+      case 'insertPictureAtCursor': {
+        const dataBase64 = p.dataBase64;
+        const mime = p.mime;
+        if (typeof dataBase64 !== 'string') {
+          reply(undefined, 'insertPictureAtCursor: missing dataBase64');
+          break;
+        }
+        if (typeof mime !== 'string') {
+          reply(undefined, 'insertPictureAtCursor: missing mime');
+          break;
+        }
+
+        let ext: 'jpg' | 'png';
+        if (mime === 'image/jpeg') {
+          ext = 'jpg';
+        } else if (mime === 'image/png') {
+          ext = 'png';
+        } else {
+          reply(undefined, `insertPictureAtCursor: unsupported mime: ${mime}`);
+          break;
+        }
+
+        const binary = atob(dataBase64);
+        const data = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+        const blob = new Blob([data], { type: mime });
+        const img = new Image();
+        const url = URL.createObjectURL(blob);
+        try {
+          img.src = url;
+          await img.decode();
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+
+        let wHwp = Math.round(img.naturalWidth * 75);
+        let hHwp = Math.round(img.naturalHeight * 75);
+        const inputHandler = getInputHandler();
+        if (!inputHandler) {
+          reply(undefined, 'insertPictureAtCursor: editor not initialized');
+          break;
+        }
+
+        const pos = inputHandler.getCursorPosition();
+        try {
+          const pageDef = wasm.getPageDef(pos.sectionIndex);
+          const colWidth = pageDef.width - pageDef.marginLeft - pageDef.marginRight;
+          if (wHwp > colWidth) {
+            const ratio = colWidth / wHwp;
+            wHwp = Math.round(colWidth);
+            hHwp = Math.round(hHwp * ratio);
+          }
+        } catch { /* 페이지 정보 없으면 그대로 */ }
+
+        const naturalWidth = img.naturalWidth;
+        const naturalHeight = img.naturalHeight;
+        let inserted = false;
+        inputHandler.executeOperation({
+          kind: 'snapshot',
+          operationType: 'pasteImage',
+          operation: (operationWasm) => {
+            const currentPos = inputHandler.getCursorPosition();
+            const result = operationWasm.insertPicture(
+              currentPos.sectionIndex,
+              currentPos.paragraphIndex,
+              currentPos.charOffset,
+              data,
+              wHwp,
+              hHwp,
+              naturalWidth,
+              naturalHeight,
+              ext,
+              '',
+            );
+            if (result.ok) {
+              inserted = true;
+              return {
+                sectionIndex: currentPos.sectionIndex,
+                paragraphIndex: result.paraIdx + 1,
+                charOffset: 0,
+              };
+            }
+            return currentPos;
+          },
+        });
+
+        if (!inserted) {
+          reply(undefined, 'insertPictureAtCursor: insertPicture failed');
+          break;
+        }
+        reply({ ok: true });
         break;
       }
 
