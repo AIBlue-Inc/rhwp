@@ -696,7 +696,7 @@ fn test_control_text_positions_empty() {
 }
 
 #[test]
-fn test_control_text_positions_no_offsets_inline_sequential() {
+fn test_control_text_positions_empty_text_controls_share_zero() {
     let para = Paragraph {
         text: String::new(),
         char_offsets: vec![],
@@ -706,8 +706,8 @@ fn test_control_text_positions_no_offsets_inline_sequential() {
         ],
         ..Default::default()
     };
-    // 인라인 컨트롤 2개: 첫 번째 push 0 후 pos += 1, 두 번째 push 1
-    assert_eq!(para.control_text_positions(), vec![0, 1]);
+    // Empty text has only one valid anchor, even with multiple controls.
+    assert_eq!(para.control_text_positions(), vec![0, 0]);
 }
 
 #[test]
@@ -764,7 +764,7 @@ fn test_control_text_positions_no_offsets_non_inline_skipped() {
     //   - Bookmark: push pos=1, 비인라인이라 pos 유지
     // 결과: [0, 0, 1]
     let para = Paragraph {
-        text: String::new(),
+        text: "AB".into(),
         char_offsets: vec![],
         controls: vec![
             Control::Bookmark(Bookmark::default()),
@@ -774,4 +774,21 @@ fn test_control_text_positions_no_offsets_non_inline_skipped() {
         ..Default::default()
     };
     assert_eq!(para.control_text_positions(), vec![0, 0, 1]);
+}
+
+
+#[test]
+fn test_hwpx_metadata_without_gap_keeps_later_control_positions() {
+    let para = Paragraph {
+        text: "ABCDE".into(),
+        char_offsets: vec![0, 9, 10, 11, 20],
+        char_count: 22,
+        controls: vec![
+            Control::ColumnDef(Default::default()),
+            Control::Table(Box::<Table>::default()),
+            Control::Table(Box::<Table>::default()),
+        ],
+        ..Default::default()
+    };
+    assert_eq!(para.control_text_positions(), vec![0, 1, 4]);
 }

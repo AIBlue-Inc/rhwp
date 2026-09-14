@@ -1038,6 +1038,7 @@ fn parse_picture(
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
+            Ok(Event::Empty(ref ce)) if local_name(ce.name().as_ref()) == b"shapeComment" => {}
             Ok(Event::Start(ref ce)) | Ok(Event::Empty(ref ce)) => {
                 let cname = ce.name(); let local = local_name(cname.as_ref());
                 match local {
@@ -1065,6 +1066,33 @@ fn parse_picture(
                                     shape_attr.current_height = v;
                                     if v > 0 { common.height = v; }
                                 }
+                                _ => {}
+                            }
+                        }
+                    }
+                    b"shapeComment" => {
+                        let raw = reader.read_text(ce.name())
+                            .map_err(|e| HwpxError::XmlError(format!("shapeComment: {}", e)))?;
+                        common.description = quick_xml::escape::unescape(&raw)
+                            .map_err(|e| HwpxError::XmlError(format!("shapeComment: {}", e)))?.into_owned();
+                    }
+                    b"flip" => {
+                        for attr in ce.attributes().flatten() {
+                            let value = matches!(attr_str(&attr).as_str(), "1" | "true");
+                            match attr.key.as_ref() {
+                                b"horizontal" => shape_attr.horz_flip = value,
+                                b"vertical" => shape_attr.vert_flip = value,
+                                _ => {}
+                            }
+                        }
+                        shape_attr.flip = u32::from(shape_attr.horz_flip) | (u32::from(shape_attr.vert_flip) << 1);
+                    }
+                    b"rotationInfo" => {
+                        for attr in ce.attributes().flatten() {
+                            match attr.key.as_ref() {
+                                b"angle" => shape_attr.rotation_angle = parse_i16(&attr),
+                                b"centerX" => shape_attr.rotation_center.x = parse_i32(&attr),
+                                b"centerY" => shape_attr.rotation_center.y = parse_i32(&attr),
                                 _ => {}
                             }
                         }

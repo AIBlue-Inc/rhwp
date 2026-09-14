@@ -175,9 +175,9 @@ fn write_border_fills<W: Write>(
         &[("itemCnt", &doc_info.border_fills.len().to_string())],
     )?;
     // HWPX borderFill의 id는 1부터 시작 (관찰값: ref_empty.hwpx).
-    // 그러나 rhwp parser는 인덱스 기반으로 저장하므로 id는 배열 인덱스 그대로 사용.
+    // IR의 border_fill_id도 1-based 참조이므로 배열 인덱스에 1을 더한다.
     for (idx, bf) in doc_info.border_fills.iter().enumerate() {
-        write_border_fill(w, idx as u16, bf)?;
+        write_border_fill(w, (idx + 1) as u16, bf)?;
     }
     end_tag(w, "hh:borderFills")?;
     Ok(())
@@ -193,7 +193,7 @@ fn write_border_fill<W: Write>(
         w,
         "hh:borderFill",
         &[
-            ("id", &(id + 1).to_string()), // HWPX 관찰: id는 1-based
+            ("id", &id.to_string()), // caller supplies the 1-based ID
             ("threeD", "0"),
             ("shadow", "0"),
             ("centerLine", "NONE"),

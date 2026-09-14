@@ -98,8 +98,10 @@ impl SerializeContext {
         for (idx, _) in doc.doc_info.para_shapes.iter().enumerate() {
             ctx.para_shape_ids.register(idx as u16);
         }
+        // BorderFill references are one-based; zero means no border/fill.
+        ctx.border_fill_ids.register(0);
         for (idx, _) in doc.doc_info.border_fills.iter().enumerate() {
-            ctx.border_fill_ids.register(idx as u16);
+            ctx.border_fill_ids.register((idx + 1) as u16);
         }
         for (idx, _) in doc.doc_info.tab_defs.iter().enumerate() {
             ctx.tab_pr_ids.register(idx as u16);

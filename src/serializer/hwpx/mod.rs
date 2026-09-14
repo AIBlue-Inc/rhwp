@@ -41,7 +41,7 @@ pub fn serialize_hwpx(doc: &Document) -> Result<Vec<u8>, SerializeError> {
     use static_assets::*;
 
     // 1-pass: ID 풀 구성
-    let ctx = SerializeContext::collect_from_document(doc);
+    let mut ctx = SerializeContext::collect_from_document(doc);
 
     let mut z = HwpxZipWriter::new();
 
@@ -60,7 +60,7 @@ pub fn serialize_hwpx(doc: &Document) -> Result<Vec<u8>, SerializeError> {
         .map(|i| format!("Contents/section{}.xml", i))
         .collect();
     for (i, sec) in doc.sections.iter().enumerate() {
-        let xml = section::write_section(sec, doc, i, &ctx)?;
+        let xml = section::write_section(sec, doc, i, &mut ctx)?;
         z.write_deflated(&section_hrefs[i], &xml)?;
     }
 

@@ -150,6 +150,64 @@ impl DocumentCore {
         control_idx: usize,
         props_json: &str,
     ) -> Result<String, HwpError> {
+        let caption_created = self.apply_picture_properties(
+            section_idx, parent_para_idx, control_idx, props_json,
+        )?;
+
+        // 리플로우
+        let section = &mut self.document.sections[section_idx];
+        section.raw_stream = None;
+        self.recompose_section(section_idx);
+        self.paginate_if_needed();
+
+        self.event_log.push(DocumentEvent::PictureResized { section: section_idx, para: parent_para_idx, ctrl: control_idx });
+        if caption_created {
+            let char_offset = match &self.document.sections[section_idx]
+                .paragraphs[parent_para_idx].controls[control_idx] {
+                crate::model::control::Control::Picture(p) => {
+                    p.caption.as_ref().map_or(0, |c|
+                        c.paragraphs.first().map_or(0, |p| p.text.chars().count()))
+                }
+                _ => 0,
+            };
+            Ok(format!("{{\"ok\":true,\"captionCharOffset\":{}}}", char_offset))
+        } else {
+            Ok("{\"ok\":true}".to_string())
+        }
+    }
+
+    /// HwpUnit is unsigned; reject unrepresentable offsets instead of silently ignoring them.
+    fn picture_numeric_property(props: &str, key: &str, min: i32) -> Result<Option<u32>, HwpError> {
+        let pattern = format!("\"{}\"", key);
+        // A matching string value (e.g. description:"width") is not a property key.
+        let rest = props.match_indices(&pattern).filter_map(|(pos, _)| {
+            props[pos + pattern.len()..].trim_start().strip_prefix(':')
+        }).last();
+        let Some(rest) = rest else { return Ok(None); };
+        let invalid = || HwpError::RenderError(format!("E_INVALID: {} must be an integer in {}..={}", key, min, i32::MAX));
+        let rest = rest.trim_start();
+        let token = rest.split([',', '}']).next().unwrap_or("").trim();
+        let value = token.parse::<i32>().map_err(|_| invalid())?;
+        if value < min { return Err(invalid()); }
+        Ok(Some(value as u32))
+    }
+
+    fn validate_picture_properties(props: &str) -> Result<(), HwpError> {
+        for (key, min) in [("vertOffset", 0), ("horzOffset", 0), ("width", 1), ("height", 1)] {
+            Self::picture_numeric_property(props, key, min)?;
+        }
+        Ok(())
+    }
+
+    /// 삽입과 속성 변경이 공유하는 파서. 재조판과 이벤트는 호출자가 처리한다.
+    fn apply_picture_properties(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        props_json: &str,
+    ) -> Result<bool, HwpError> {
+        Self::validate_picture_properties(props_json)?;
         // JSON 파싱 (serde_json 사용 대신 수동 파싱 — 기존 패턴)
         let section = self.document.sections.get_mut(section_idx)
             .ok_or_else(|| HwpError::RenderError(format!("구역 인덱스 {} 범위 초과", section_idx)))?;
@@ -166,8 +224,8 @@ impl DocumentCore {
         use super::super::helpers::{json_u32, json_i32, json_i16, json_bool, json_str};
 
         // 크기 변경
-        if let Some(w) = json_u32(props_json, "width") { pic.common.width = w; pic.shape_attr.current_width = w; }
-        if let Some(h) = json_u32(props_json, "height") { pic.common.height = h; pic.shape_attr.current_height = h; }
+        if let Some(w) = Self::picture_numeric_property(props_json, "width", 1)? { pic.common.width = w; pic.shape_attr.current_width = w; }
+        if let Some(h) = Self::picture_numeric_property(props_json, "height", 1)? { pic.common.height = h; pic.shape_attr.current_height = h; }
 
         // 위치 속성
         if let Some(tac) = json_bool(props_json, "treatAsChar") {
@@ -223,8 +281,8 @@ impl DocumentCore {
                 _ => pic.common.text_wrap,
             };
         }
-        if let Some(v) = json_u32(props_json, "vertOffset") { pic.common.vertical_offset = v; }
-        if let Some(v) = json_u32(props_json, "horzOffset") { pic.common.horizontal_offset = v; }
+        if let Some(v) = Self::picture_numeric_property(props_json, "vertOffset", 0)? { pic.common.vertical_offset = v; }
+        if let Some(v) = Self::picture_numeric_property(props_json, "horzOffset", 0)? { pic.common.horizontal_offset = v; }
 
         // 이미지 속성
         if let Some(v) = json_i32(props_json, "brightness") { pic.image_attr.brightness = v as i8; }
@@ -324,6 +382,23 @@ impl DocumentCore {
             }
         }
 
+        // HWP CTRL_HEADER는 attr을 그대로 저장하므로 파싱된 위치/배치와 동기화한다.
+        let c = &mut pic.common;
+        let wrap = match c.text_wrap {
+            crate::model::shape::TextWrap::TopAndBottom => 1,
+            crate::model::shape::TextWrap::BehindText => 2,
+            crate::model::shape::TextWrap::InFrontOfText => 3,
+            _ => 0,
+        };
+        let position_mask = 1 | (3 << 3) | (7 << 5) | (3 << 8) | (7 << 10) | (7 << 21);
+        c.attr = (c.attr & !position_mask)
+            | u32::from(c.treat_as_char)
+            | ((c.vert_rel_to as u32) << 3)
+            | ((c.vert_align as u32) << 5)
+            | ((c.horz_rel_to as u32) << 8)
+            | ((c.horz_align as u32) << 10)
+            | (wrap << 21);
+
         // 캡션 생성 시 AutoNumber 재할당 + 텍스트 생성
         // 한컴 방식: "그림 " + [AutoNumber 제어문자 8 code units] + " "
         // AutoNumber가 번호를 렌더링하므로 텍스트에 번호를 넣지 않는다.
@@ -343,26 +418,7 @@ impl DocumentCore {
             para.char_count = 13;
         }
 
-        // 리플로우
-        let section = &mut self.document.sections[section_idx];
-        section.raw_stream = None;
-        self.recompose_section(section_idx);
-        self.paginate_if_needed();
-
-        self.event_log.push(DocumentEvent::PictureResized { section: section_idx, para: parent_para_idx, ctrl: control_idx });
-        if caption_created {
-            let char_offset = match &self.document.sections[section_idx]
-                .paragraphs[parent_para_idx].controls[control_idx] {
-                crate::model::control::Control::Picture(p) => {
-                    p.caption.as_ref().map_or(0, |c|
-                        c.paragraphs.first().map_or(0, |p| p.text.chars().count()))
-                }
-                _ => 0,
-            };
-            Ok(format!("{{\"ok\":true,\"captionCharOffset\":{}}}", char_offset))
-        } else {
-            Ok("{\"ok\":true}".to_string())
-        }
+        Ok(caption_created)
     }
 
     /// 그림 컨트롤을 문단에서 삭제한다 (네이티브).
@@ -396,15 +452,19 @@ impl DocumentCore {
             ));
         }
 
+        let affects_line_height = matches!(&para.controls[control_idx],
+            Control::Picture(pic) if pic.common.treat_as_char);
+
         // 컨트롤이 차지하는 갭의 시작 위치를 찾아 char_offsets 조정
+        let slot_indices = para.text_control_indices();
         let text_chars: Vec<char> = para.text.chars().collect();
         let mut ci = 0usize;
         let mut prev_end: u32 = 0;
         let mut gap_start: Option<u32> = None;
         'outer: for i in 0..text_chars.len() {
             let offset = if i < para.char_offsets.len() { para.char_offsets[i] } else { prev_end };
-            while prev_end + 8 <= offset && ci < para.controls.len() {
-                if ci == control_idx {
+            while prev_end + 8 <= offset && ci < slot_indices.len() {
+                if slot_indices[ci] == control_idx {
                     gap_start = Some(prev_end);
                     break 'outer;
                 }
@@ -417,8 +477,8 @@ impl DocumentCore {
             prev_end = offset + char_size;
         }
         if gap_start.is_none() {
-            while ci < para.controls.len() {
-                if ci == control_idx {
+            while ci < slot_indices.len() {
+                if slot_indices[ci] == control_idx {
                     gap_start = Some(prev_end);
                     break;
                 }
@@ -435,6 +495,16 @@ impl DocumentCore {
                     *offset -= 8;
                 }
             }
+            for cs in &mut para.char_shapes {
+                if cs.start_pos >= threshold { cs.start_pos -= 8; }
+            }
+            for seg in &mut para.line_segs {
+                if seg.text_start >= threshold { seg.text_start -= 8; }
+            }
+            for range in &mut para.range_tags {
+                if range.start >= threshold { range.start -= 8; }
+                if range.end >= threshold { range.end -= 8; }
+            }
         }
 
         // 컨트롤 및 ctrl_data_record 제거
@@ -447,9 +517,17 @@ impl DocumentCore {
         if para.char_count >= 8 {
             para.char_count -= 8;
         }
+        if !para.controls.iter().any(|c| matches!(c,
+            Control::Table(_) | Control::Picture(_) | Control::Shape(_) | Control::Equation(_)
+                | Control::Form(_) | Control::Hyperlink(_) | Control::Ruby(_)
+        )) {
+            para.control_mask &= !(1 << 11);
+        }
 
         // line_segs 재계산: 그림 높이가 반영된 line_segs를 텍스트 기반으로 리셋
-        Self::reflow_paragraph_line_segs_after_control_delete(para, &self.styles, self.dpi);
+        if affects_line_height {
+            Self::reflow_paragraph_line_segs_after_control_delete(para, &self.styles, self.dpi);
+        }
 
         section.raw_stream = None;
         self.recompose_section(section_idx);
@@ -482,7 +560,7 @@ impl DocumentCore {
             if let Some(ls) = para.line_segs.first_mut() {
                 ls.line_height = max_remaining_ctrl_height;
                 ls.text_height = max_remaining_ctrl_height;
-                ls.baseline_distance = (max_remaining_ctrl_height * 850) / 1000;
+                ls.baseline_distance = (i64::from(max_remaining_ctrl_height) * 850 / 1000) as i32;
             }
         } else if para.text.is_empty() {
             // 텍스트도 컨트롤도 없음 → 기본 텍스트 높이로 리셋
@@ -1049,9 +1127,6 @@ impl DocumentCore {
         extension: &str,
         description: &str,
     ) -> Result<String, HwpError> {
-        use crate::model::image::{Picture, ImageAttr, ImageEffect, CropInfo};
-        use crate::model::shape::{CommonObjAttr, ShapeComponentAttr, VertRelTo, HorzRelTo};
-        use crate::model::bin_data::{BinData, BinDataType, BinDataCompression, BinDataStatus, BinDataContent};
         use crate::model::paragraph::{CharShapeRef, LineSeg};
         // 유효성 검사
         if section_idx >= self.document.sections.len() {
@@ -1068,86 +1143,10 @@ impl DocumentCore {
             return Err(HwpError::RenderError("이미지 데이터가 비어 있습니다".to_string()));
         }
 
-        // --- 1. BinDataContent 추가 ---
-        let next_id = self.document.bin_data_content.len() as u16 + 1;
-        self.document.bin_data_content.push(BinDataContent {
-            id: next_id,
-            data: image_data.to_vec(),
-            extension: extension.to_string(),
-        });
-
-        // --- 2. BinData 메타데이터 추가 ---
-        // attr: bits 0-3=1(Embedding), bits 4-5=0(Default), bits 8-9=1(Success)
-        let bin_attr: u16 = 0x0101;
-        self.document.doc_info.bin_data_list.push(BinData {
-            raw_data: None,
-            attr: bin_attr,
-            data_type: BinDataType::Embedding,
-            compression: BinDataCompression::Default,
-            status: BinDataStatus::Success,
-            abs_path: None,
-            rel_path: None,
-            storage_id: next_id,
-            extension: Some(extension.to_string()),
-        });
-        self.document.doc_info.raw_stream = None; // DocInfo 재직렬화
-
-        // --- 3. Picture 컨트롤 생성 ---
-        // CommonObjAttr: treat_as_char, vert_rel_to=Para, horz_rel_to=Column,
-        // width_criterion=absolute(4), height_criterion=absolute(2)
-        let common_attr: u32 = 0x01 | (2 << 3) | (2 << 8) | (4 << 15) | (2 << 18); // 0x0A0211
-        let common = CommonObjAttr {
-            ctrl_id: 0x67736F20, // "gso " — GenShape
-            attr: common_attr,
-            treat_as_char: true,
-            vert_rel_to: VertRelTo::Para,
-            horz_rel_to: HorzRelTo::Column,
-            width,
-            height,
-            z_order: 0,
-            description: description.to_string(),
-            ..Default::default()
-        };
-
-        let shape_attr = ShapeComponentAttr {
-            original_width: width,
-            original_height: height,
-            current_width: width,
-            current_height: height,
-            local_file_version: 1,
-            render_sx: 1.0,
-            render_sy: 1.0,
-            ..Default::default()
-        };
-
-        // border_x/border_y: 4 꼭짓점 좌표 (x,y 쌍으로 연속 저장)
-        // [tl.x, tl.y, tr.x, tr.y], [br.x, br.y, bl.x, bl.y]
-        let bx = [0i32, 0, width as i32, 0];
-        let by = [width as i32, height as i32, 0, height as i32];
-
-        // crop: 비크롭 시 이미지 원본 범위 (원본 크기 = 디스플레이 크기일 때)
-        // crop: 이미지 원본 픽셀 크기 × 75 (HWPUNIT/pixel at 96DPI)
-        let crop = CropInfo {
-            left: 0,
-            top: 0,
-            right: (natural_width_px * 75) as i32,
-            bottom: (natural_height_px * 75) as i32,
-        };
-
-        let pic = Picture {
-            common,
-            shape_attr,
-            border_x: bx,
-            border_y: by,
-            crop,
-            image_attr: ImageAttr {
-                bin_data_id: next_id,
-                brightness: 0,
-                contrast: 0,
-                effect: ImageEffect::RealPic,
-            },
-            ..Default::default()
-        };
+        let pic = self.create_picture_control(
+            image_data, width, height, natural_width_px, natural_height_px,
+            extension, description,
+        )?;
 
         // --- 4. 그림 포함 문단 생성 + 삽입 (createTable 패턴) ---
         let current_para = &self.document.sections[section_idx].paragraphs[para_idx];
@@ -1176,7 +1175,7 @@ impl DocumentCore {
                 text_start: 0,
                 line_height: height as i32,
                 text_height: height as i32,
-                baseline_distance: (height as i32 * 850) / 1000,
+                baseline_distance: (i64::from(height) * 850 / 1000) as i32,
                 line_spacing: 600,
                 segment_width: content_width as i32,
                 tag: 0x00060000,
@@ -1255,6 +1254,192 @@ impl DocumentCore {
 
         self.event_log.push(DocumentEvent::PictureInserted { section: section_idx, para: insert_para_idx });
         Ok(super::super::helpers::json_ok_with(&format!("\"paraIdx\":{},\"controlIdx\":0", insert_para_idx)))
+    }
+
+    /// 기존 문단에 그림을 추가한다. char_offset은 text의 문자 인덱스다.
+    /// 빈 props_json은 용지 기준, 글 앞으로 배치하는 떠 있는 그림을 만든다.
+    pub fn insert_picture_in_paragraph_native(
+        &mut self,
+        section_idx: usize,
+        para_idx: usize,
+        char_offset: usize,
+        image_data: &[u8],
+        width: u32,
+        height: u32,
+        natural_width_px: u32,
+        natural_height_px: u32,
+        extension: &str,
+        description: &str,
+        props_json: &str,
+    ) -> Result<String, HwpError> {
+        let section = self.document.sections.get(section_idx)
+            .ok_or_else(|| HwpError::RenderError(format!("구역 인덱스 {} 범위 초과", section_idx)))?;
+        let para = section.paragraphs.get(para_idx)
+            .ok_or_else(|| HwpError::RenderError(format!("문단 인덱스 {} 범위 초과", para_idx)))?;
+        if char_offset > para.text.chars().count() {
+            return Err(HwpError::RenderError(format!("문자 인덱스 {} 범위 초과", char_offset)));
+        }
+        if image_data.is_empty() {
+            return Err(HwpError::RenderError("이미지 데이터가 비어 있습니다".to_string()));
+        }
+
+        Self::validate_picture_properties(props_json)?;
+        let mut pic = self.create_picture_control(
+            image_data, width, height, natural_width_px, natural_height_px,
+            extension, description,
+        )?;
+        pic.common.treat_as_char = false;
+        pic.common.text_wrap = crate::model::shape::TextWrap::InFrontOfText;
+        pic.common.vert_rel_to = crate::model::shape::VertRelTo::Paper;
+        pic.common.horz_rel_to = crate::model::shape::HorzRelTo::Paper;
+
+        let section = &mut self.document.sections[section_idx];
+        section.raw_stream = None;
+        let para = &mut section.paragraphs[para_idx];
+        // char_offsets points past any controls already anchored at this character.
+        // Insert after those controls, but before controls at later text positions.
+        let control_idx = para.control_text_positions().partition_point(|&pos| pos <= char_offset);
+        para.ctrl_data_records.resize(para.controls.len(), None);
+        para.controls.insert(control_idx, Control::Picture(Box::new(pic)));
+        para.ctrl_data_records.insert(control_idx, None);
+
+        // 표와 같은 확장 제어문자 규약: text는 유지하고 UTF-16 위치에 8칸 갭을 만든다.
+        // 문단 끝에서는 기존 후행 컨트롤까지 포함한 끝 위치 뒤에 추가한다.
+        let insert_pos = para.char_offsets.get(char_offset).copied()
+            .unwrap_or_else(|| para.char_count.saturating_sub(1));
+        for offset in &mut para.char_offsets {
+            if *offset >= insert_pos { *offset += 8; }
+        }
+        for cs in &mut para.char_shapes {
+            if cs.start_pos >= insert_pos && cs.start_pos > 0 { cs.start_pos += 8; }
+        }
+        for seg in &mut para.line_segs {
+            if seg.text_start > insert_pos { seg.text_start += 8; }
+        }
+        for range in &mut para.range_tags {
+            if range.start >= insert_pos { range.start += 8; }
+            if range.end >= insert_pos { range.end += 8; }
+        }
+        para.char_count = para.char_count.max(1) + 8;
+        para.control_mask |= 1 << 11;
+        para.has_para_text = true;
+
+        self.apply_picture_properties(section_idx, para_idx, control_idx, props_json)?;
+        self.recompose_section(section_idx);
+        self.paginate_if_needed();
+        self.event_log.push(DocumentEvent::PictureInserted { section: section_idx, para: para_idx });
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"paraIdx\":{},\"controlIdx\":{}", para_idx, control_idx,
+        )))
+    }
+
+    fn create_picture_control(
+        &mut self,
+        image_data: &[u8],
+        width: u32,
+        height: u32,
+        natural_width_px: u32,
+        natural_height_px: u32,
+        extension: &str,
+        description: &str,
+    ) -> Result<crate::model::image::Picture, HwpError> {
+        use crate::model::image::{Picture, ImageAttr, ImageEffect, CropInfo};
+        use crate::model::shape::{CommonObjAttr, ShapeComponentAttr, VertRelTo, HorzRelTo};
+        use crate::model::bin_data::{BinData, BinDataType, BinDataCompression, BinDataStatus, BinDataContent};
+        // Validate before allocating BinData or touching the document (also shared by insertPicture).
+        const MAX_NATURAL_PX: u32 = 4096;
+        let crop_units = |pixels: u32| -> Result<i32, HwpError> {
+            if pixels == 0 || pixels > MAX_NATURAL_PX {
+                return Err(HwpError::RenderError("E_INVALID: natural image size must be 1..=4096px".into()));
+            }
+            pixels.checked_mul(75).and_then(|v| i32::try_from(v).ok())
+                .ok_or_else(|| HwpError::RenderError("E_INVALID: image size overflow".into()))
+        };
+        let crop_right = crop_units(natural_width_px)?;
+        let crop_bottom = crop_units(natural_height_px)?;
+        if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
+            return Err(HwpError::RenderError("E_INVALID: picture dimensions must be 1..=i32::MAX".into()));
+        }
+        // --- 1. BinDataContent 추가 ---
+        let next_id = self.document.bin_data_content.len() as u16 + 1;
+        self.document.bin_data_content.push(BinDataContent {
+            id: next_id,
+            data: image_data.to_vec(),
+            extension: extension.to_string(),
+        });
+
+        // --- 2. BinData 메타데이터 추가 ---
+        // attr: bits 0-3=1(Embedding), bits 4-5=0(Default), bits 8-9=1(Success)
+        let bin_attr: u16 = 0x0101;
+        self.document.doc_info.bin_data_list.push(BinData {
+            raw_data: None,
+            attr: bin_attr,
+            data_type: BinDataType::Embedding,
+            compression: BinDataCompression::Default,
+            status: BinDataStatus::Success,
+            abs_path: None,
+            rel_path: None,
+            storage_id: next_id,
+            extension: Some(extension.to_string()),
+        });
+        self.document.doc_info.raw_stream = None; // DocInfo 재직렬화
+
+        // --- 3. Picture 컨트롤 생성 ---
+        // CommonObjAttr: treat_as_char, vert_rel_to=Para, horz_rel_to=Column,
+        // width_criterion=absolute(4), height_criterion=absolute(2)
+        let common_attr: u32 = 0x01 | (2 << 3) | (2 << 8) | (4 << 15) | (2 << 18); // 0x0A0211
+        let common = CommonObjAttr {
+            ctrl_id: 0x67736F20, // "gso " — GenShape
+            attr: common_attr,
+            treat_as_char: true,
+            vert_rel_to: VertRelTo::Para,
+            horz_rel_to: HorzRelTo::Column,
+            width,
+            height,
+            z_order: 0,
+            description: description.to_string(),
+            ..Default::default()
+        };
+
+        let shape_attr = ShapeComponentAttr {
+            original_width: width,
+            original_height: height,
+            current_width: width,
+            current_height: height,
+            local_file_version: 1,
+            render_sx: 1.0,
+            render_sy: 1.0,
+            ..Default::default()
+        };
+
+        // border_x/border_y: 4 꼭짓점 좌표 (x,y 쌍으로 연속 저장)
+        // [tl.x, tl.y, tr.x, tr.y], [br.x, br.y, bl.x, bl.y]
+        let bx = [0i32, 0, width as i32, 0];
+        let by = [width as i32, height as i32, 0, height as i32];
+
+        // crop: 비크롭 시 이미지 원본 범위 (원본 크기 = 디스플레이 크기일 때)
+        // crop: 이미지 원본 픽셀 크기 × 75 (HWPUNIT/pixel at 96DPI)
+        let crop = CropInfo {
+            left: 0,
+            top: 0,
+            right: crop_right,
+            bottom: crop_bottom,
+        };
+
+        Ok(Picture {
+            common,
+            shape_attr,
+            border_x: bx,
+            border_y: by,
+            crop,
+            image_attr: ImageAttr {
+                bin_data_id: next_id,
+                brightness: 0,
+                contrast: 0,
+                effect: ImageEffect::RealPic,
+            },
+            ..Default::default()
+        })
     }
 
     /// 표의 모든 셀 bbox를 반환한다 (네이티브).

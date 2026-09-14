@@ -1988,6 +1988,30 @@ impl HwpDocument {
         .map_err(|e| e.into())
     }
 
+    /// 기존 문단에 그림을 추가한다. props_json 생략 시 용지 기준 떠 있는 그림.
+    /// 반환: JSON `{"ok":true,"paraIdx":<호스트 문단>,"controlIdx":<새 컨트롤>}`
+    #[wasm_bindgen(js_name = insertPictureInParagraph)]
+    pub fn insert_picture_in_paragraph(
+        &mut self,
+        section_idx: u32,
+        para_idx: u32,
+        char_offset: u32,
+        image_data: &[u8],
+        width: u32,
+        height: u32,
+        natural_width_px: u32,
+        natural_height_px: u32,
+        extension: &str,
+        description: &str,
+        props_json: Option<String>,
+    ) -> Result<String, JsValue> {
+        self.insert_picture_in_paragraph_native(
+            section_idx as usize, para_idx as usize, char_offset as usize,
+            image_data, width, height, natural_width_px, natural_height_px,
+            extension, description, props_json.as_deref().unwrap_or(""),
+        ).map_err(|e| e.into())
+    }
+
     /// 그림 컨트롤의 속성을 조회한다.
     ///
     /// 반환: JSON `{ width, height, treatAsChar, ... }`

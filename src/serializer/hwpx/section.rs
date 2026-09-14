@@ -53,14 +53,14 @@ pub fn write_section(
     section: &Section,
     _doc: &Document,
     _index: usize,
-    ctx: &SerializeContext,
+    ctx: &mut SerializeContext,
 ) -> Result<Vec<u8>, SerializeError> {
     let _ = ctx;
     let mut vert_cursor: u32 = 0;
 
     let first_para = section.paragraphs.first();
     let (first_t, first_linesegs, first_advance) = match first_para {
-        Some(p) => render_paragraph_parts(p, vert_cursor),
+        Some(p) => render_paragraph_parts(p, vert_cursor, ctx)?,
         None => render_paragraph_parts_for_text("", vert_cursor),
     };
     vert_cursor = first_advance;
@@ -89,7 +89,7 @@ pub fn write_section(
     if section.paragraphs.len() > 1 {
         let mut extra = String::new();
         for (idx, p) in section.paragraphs.iter().enumerate().skip(1) {
-            let (t, linesegs, advance) = render_paragraph_parts(p, vert_cursor);
+            let (t, linesegs, advance) = render_paragraph_parts(p, vert_cursor, ctx)?;
             vert_cursor = advance;
             let cs = first_run_char_shape_id(p);
             extra.push_str(&render_hp_p_open(p, idx as u32));
@@ -129,18 +129,18 @@ fn first_run_char_shape_id(p: &Paragraph) -> u32 {
 /// `<hp:lineseg>` 출력 원칙 (#177):
 /// - `para.line_segs` 가 비어있지 않으면 **IR 값 그대로 출력**
 /// - 비어있을 때만 텍스트 내 `\n` 기반으로 fallback 생성 (빈 문단·`Document::default()` 호환)
-fn render_paragraph_parts(para: &Paragraph, vert_start: u32) -> (String, String, u32) {
-    let t_xml = render_run_content(para);
+fn render_paragraph_parts(para: &Paragraph, vert_start: u32, ctx: &mut SerializeContext) -> Result<(String, String, u32), SerializeError> {
+    let t_xml = render_run_content(para, ctx)?;
 
     if !para.line_segs.is_empty() {
         // IR 기반 출력 — 원본 lineseg 값 보존 (#177)
         let linesegs = render_lineseg_array_from_ir(&para.line_segs);
         let vert_end = next_vert_cursor_from_ir(&para.line_segs, vert_start);
-        (t_xml, linesegs, vert_end)
+        Ok((t_xml, linesegs, vert_end))
     } else {
         // Fallback — IR에 line_segs 가 없으면 기존 생성 로직 유지
         let (linesegs, vert_end) = render_lineseg_array_fallback(&para.text, vert_start);
-        (t_xml, linesegs, vert_end)
+        Ok((t_xml, linesegs, vert_end))
     }
 }
 
@@ -179,7 +179,7 @@ fn render_hp_t_content(text: &str) -> String {
 }
 
 /// Paragraph의 본문 run 콘텐츠를 `<hp:t>`와 인라인 컨트롤 XML로 직렬화한다.
-fn render_run_content(para: &Paragraph) -> String {
+pub(super) fn render_run_content(para: &Paragraph, ctx: &mut SerializeContext) -> Result<String, SerializeError> {
     let slot_count = inferred_control_slot_count(para);
     let slots: Vec<&Control> = if slot_count == para.controls.len() {
         para.controls.iter().collect()
@@ -189,21 +189,18 @@ fn render_run_content(para: &Paragraph) -> String {
             .collect()
     };
 
-    if !slots.iter().any(|c| matches!(c, Control::Equation(_))) {
-        return render_hp_t_content(&para.text);
-    }
-
     if slot_count != slots.len() {
         let mut out = render_hp_t_content(&para.text);
         for slot in slots {
-            render_control_slot(&mut out, slot);
+            render_control_slot(&mut out, slot, ctx)?;
         }
-        return out;
+        return Ok(out);
     }
 
     let mut out = String::new();
     let mut text_buf = String::new();
     let mut slot_idx = 0usize;
+    let mut current_style = first_run_char_shape_id(para);
     let mut expected_utf16_pos = 0u32;
 
     for (idx, c) in para.text.chars().enumerate() {
@@ -215,12 +212,14 @@ fn render_run_content(para: &Paragraph) -> String {
         while slot_idx < slots.len()
             && char_pos >= expected_utf16_pos.saturating_add(8)
         {
+            switch_run_style(para, expected_utf16_pos, &mut current_style, &mut out, &mut text_buf);
             flush_text_fragment(&mut out, &mut text_buf);
-            render_control_slot(&mut out, slots[slot_idx]);
+            render_control_slot(&mut out, slots[slot_idx], ctx)?;
             slot_idx += 1;
             expected_utf16_pos = expected_utf16_pos.saturating_add(8);
         }
 
+        switch_run_style(para, char_pos, &mut current_style, &mut out, &mut text_buf);
         text_buf.push(c);
         let width = char_utf16_width(c);
         if char_pos >= expected_utf16_pos {
@@ -232,14 +231,27 @@ fn render_run_content(para: &Paragraph) -> String {
 
     flush_text_fragment(&mut out, &mut text_buf);
     while slot_idx < slots.len() {
-        render_control_slot(&mut out, slots[slot_idx]);
+        switch_run_style(para, expected_utf16_pos, &mut current_style, &mut out, &mut text_buf);
+        render_control_slot(&mut out, slots[slot_idx], ctx)?;
         slot_idx += 1;
+        expected_utf16_pos = expected_utf16_pos.saturating_add(8);
     }
 
     if out.is_empty() {
-        render_hp_t_content("")
+        Ok(render_hp_t_content(""))
     } else {
-        out
+        Ok(out)
+    }
+}
+
+// Callers open/close the first/last run; split its contents at real style changes.
+fn switch_run_style(para: &Paragraph, pos: u32, current: &mut u32, out: &mut String, text: &mut String) {
+    let style = para.char_shapes.iter().rev().find(|s| s.start_pos <= pos)
+        .map(|s| s.char_shape_id).unwrap_or(*current);
+    if style != *current {
+        flush_text_fragment(out, text);
+        out.push_str(&format!(r#"</hp:run><hp:run charPrIDRef="{}">"#, style));
+        *current = style;
     }
 }
 
@@ -284,10 +296,17 @@ fn flush_text_fragment(out: &mut String, text_buf: &mut String) {
     }
 }
 
-fn render_control_slot(out: &mut String, control: &Control) {
-    if let Control::Equation(eq) = control {
-        out.push_str(&render_equation(eq));
+fn render_control_slot(out: &mut String, control: &Control, ctx: &mut SerializeContext) -> Result<(), SerializeError> {
+    let mut writer = quick_xml::Writer::new(Vec::new());
+    match control {
+        Control::Equation(eq) => out.push_str(&render_equation(eq)),
+        Control::Picture(pic) => super::picture::write_picture(&mut writer, pic, ctx)?,
+        Control::Table(table) => super::table::write_table(&mut writer, table, ctx)?,
+        _ => {}
     }
+    out.push_str(&String::from_utf8(writer.into_inner())
+        .map_err(|e| SerializeError::XmlError(e.to_string()))?);
+    Ok(())
 }
 
 fn render_equation(eq: &Equation) -> String {
@@ -512,8 +531,8 @@ mod tests {
         para.style_id = 3;
         para.text = "hi".to_string();
         let (doc, section) = make_doc_with_paragraph(para);
-        let ctx = SerializeContext::collect_from_document(&doc);
-        let bytes = write_section(&section, &doc, 0, &ctx).unwrap();
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let bytes = write_section(&section, &doc, 0, &mut ctx).unwrap();
         let xml = std::str::from_utf8(&bytes).unwrap();
         assert!(
             xml.contains(r#"paraPrIDRef="7""#),
@@ -535,8 +554,8 @@ mod tests {
             char_shape_id: 42,
         });
         let (doc, section) = make_doc_with_paragraph(para);
-        let ctx = SerializeContext::collect_from_document(&doc);
-        let bytes = write_section(&section, &doc, 0, &ctx).unwrap();
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let bytes = write_section(&section, &doc, 0, &mut ctx).unwrap();
         let xml = std::str::from_utf8(&bytes).unwrap();
         assert!(
             xml.contains(r#"<hp:run charPrIDRef="42"><hp:t>hello</hp:t>"#),
@@ -551,8 +570,8 @@ mod tests {
         para.text = "p1".to_string();
         para.column_type = crate::model::paragraph::ColumnBreakType::Page;
         let (doc, section) = make_doc_with_paragraph(para);
-        let ctx = SerializeContext::collect_from_document(&doc);
-        let bytes = write_section(&section, &doc, 0, &ctx).unwrap();
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let bytes = write_section(&section, &doc, 0, &mut ctx).unwrap();
         let xml = std::str::from_utf8(&bytes).unwrap();
         assert!(
             xml.contains(r#"pageBreak="1""#),
@@ -566,8 +585,8 @@ mod tests {
         let mut para = Paragraph::default();
         para.text = "x".to_string();
         let (doc, section) = make_doc_with_paragraph(para);
-        let ctx = SerializeContext::collect_from_document(&doc);
-        let bytes = write_section(&section, &doc, 0, &ctx).unwrap();
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let bytes = write_section(&section, &doc, 0, &mut ctx).unwrap();
         let xml = std::str::from_utf8(&bytes).unwrap();
         assert!(xml.contains(r#"paraPrIDRef="0""#));
         assert!(xml.contains(r#"styleIDRef="0""#));
@@ -589,8 +608,8 @@ mod tests {
         section.paragraphs.push(p2);
         let mut doc = Document::default();
         doc.sections.push(section.clone());
-        let ctx = SerializeContext::collect_from_document(&doc);
-        let xml = String::from_utf8(write_section(&section, &doc, 0, &ctx).unwrap()).unwrap();
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_section(&section, &doc, 0, &mut ctx).unwrap()).unwrap();
         // 두 번째 문단: paraPrIDRef=2, charPrIDRef=6
         assert!(xml.contains(r#"paraPrIDRef="2""#));
         assert!(
@@ -620,8 +639,8 @@ mod tests {
             tag: 999,
         });
         let (doc, section) = make_doc_with_paragraph(para);
-        let ctx = SerializeContext::collect_from_document(&doc);
-        let xml = String::from_utf8(write_section(&section, &doc, 0, &ctx).unwrap()).unwrap();
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_section(&section, &doc, 0, &mut ctx).unwrap()).unwrap();
         assert!(xml.contains(r#"<hp:lineseg textpos="0" vertpos="5000" vertsize="1200" textheight="1100" baseline="900" spacing="700" horzpos="100" horzsize="50000" flags="999"/>"#),
             "lineseg must reflect IR values exactly, got XML: {}",
             &xml[xml.find("<hp:lineseg").unwrap_or(0)..(xml.find("<hp:lineseg").unwrap_or(0) + 200).min(xml.len())]);
@@ -646,8 +665,8 @@ mod tests {
             });
         }
         let (doc, section) = make_doc_with_paragraph(para);
-        let ctx = SerializeContext::collect_from_document(&doc);
-        let xml = String::from_utf8(write_section(&section, &doc, 0, &ctx).unwrap()).unwrap();
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_section(&section, &doc, 0, &mut ctx).unwrap()).unwrap();
         // 3개 lineseg 모두 출력되고 각각의 vertsize 값이 IR 값과 일치
         assert_eq!(xml.matches("<hp:lineseg ").count(), 3);
         assert!(xml.contains(r#"textpos="0" vertpos="0" vertsize="1000""#));
@@ -661,8 +680,8 @@ mod tests {
         let mut para = Paragraph::default();
         para.text = "a\nb".to_string(); // 소프트브레이크 1개 → fallback 은 lineseg 2개 생성
         let (doc, section) = make_doc_with_paragraph(para);
-        let ctx = SerializeContext::collect_from_document(&doc);
-        let xml = String::from_utf8(write_section(&section, &doc, 0, &ctx).unwrap()).unwrap();
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_section(&section, &doc, 0, &mut ctx).unwrap()).unwrap();
         // 정적 fallback: vertsize=1000, textheight=1000, baseline=850, spacing=600
         assert!(xml.contains(r#"vertsize="1000""#));
         assert!(xml.contains(r#"baseline="850""#));
@@ -686,8 +705,8 @@ mod tests {
             tag: 0,
         });
         let (doc, section) = make_doc_with_paragraph(para);
-        let ctx = SerializeContext::collect_from_document(&doc);
-        let xml = String::from_utf8(write_section(&section, &doc, 0, &ctx).unwrap()).unwrap();
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_section(&section, &doc, 0, &mut ctx).unwrap()).unwrap();
         // IR 에 1개만 있으므로 lineseg 도 1개만 출력 (rhwp 는 원본 보존)
         assert_eq!(xml.matches("<hp:lineseg ").count(), 1);
         assert!(xml.contains(r#"vertsize="2000""#), "IR value 2000 must be used, not fallback 1000");

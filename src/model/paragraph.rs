@@ -714,11 +714,24 @@ impl Paragraph {
         Some(result_id)
     }
 
+    /// HWPX section/column metadata may be present without an 8-unit text slot.
+    pub(crate) fn text_control_indices(&self) -> Vec<usize> {
+        let text_units: u32 = self.text.chars().map(|c| if c == '\t' { 8 } else { c.len_utf16() as u32 }).sum();
+        let slot_count = self.char_count.saturating_sub(1).saturating_sub(text_units) / 8;
+        let separate_metadata = self.char_count > 0 && (slot_count as usize) < self.controls.len();
+        self.controls.iter().enumerate().filter_map(|(i, c)| {
+            if separate_metadata && matches!(c, Control::SectionDef(_) | Control::ColumnDef(_)) {
+                None
+            } else { Some(i) }
+        }).collect()
+    }
+
     /// 인라인 컨트롤이 텍스트의 어느 character 인덱스에 위치하는지 반환한다.
     ///
     /// 일반 경로에서는 `char_offsets` 갭 (인라인 컨트롤당 8 UTF-16 코드 유닛) 의 길이만으로
-    /// position 을 분배한다 — 컨트롤 variant 를 보지 않으므로 각주·미주, 그림, 표, 수식,
-    /// 자동번호 등 모든 inline 컨트롤이 동일하게 character offset 을 부여받는다.
+    /// position 을 분배한다. HWPX의 갭 없는 section/column metadata는 제외하고,
+    /// 각주·미주, 그림, 표, 수식, 자동번호 등은 갭 순서대로 character offset을 받는다.
+    /// 빈 텍스트에서는 모든 컨트롤의 앵커가 0이다.
     ///
     /// `char_offsets` 가 비어있는 폴백 경로에서는 Shape/Table/Picture/Equation 만 폭 1을
     /// 가산하고, 그 외 컨트롤은 모두 position 0 에 누적된다 (정밀도 손실 분기).
@@ -735,12 +748,25 @@ impl Paragraph {
             return vec![];
         }
 
+        if self.text.is_empty() {
+            return vec![0; total_controls];
+        }
+
+        let indices = self.text_control_indices();
+        let slot_count = indices.len();
+        let map_positions = |inline: Vec<usize>| {
+            let mut positions = vec![0; total_controls];
+            for (&i, pos) in indices.iter().zip(inline) { positions[i] = pos; }
+            positions
+        };
+
         if offsets.is_empty() {
             // char_offsets가 없는 경우: 인라인 컨트롤을 순차적으로 배치
             // secd/cold 등 비인라인 컨트롤은 position 0, 인라인 컨트롤은 순차 증가
             let mut pos = 0usize;
-            let mut positions = Vec::with_capacity(total_controls);
-            for ctrl in &self.controls {
+            let mut positions = Vec::with_capacity(slot_count);
+            for &index in &indices {
+                let ctrl = &self.controls[index];
                 positions.push(pos);
                 if matches!(
                     ctrl,
@@ -752,17 +778,17 @@ impl Paragraph {
                     pos += 1;
                 }
             }
-            return positions;
+            return map_positions(positions);
         }
 
         let chars: Vec<char> = self.text.chars().collect();
-        let mut positions = Vec::with_capacity(total_controls);
+        let mut positions = Vec::with_capacity(slot_count);
 
         // 첫 문자 이전의 갭: 확장 컨트롤이 텍스트 시작 전에 있는 경우
         let gap_before = offsets[0] as usize;
         let n_ctrls_before = gap_before / 8;
         for _ in 0..n_ctrls_before {
-            if positions.len() >= total_controls {
+            if positions.len() >= slot_count {
                 break;
             }
             positions.push(0);
@@ -770,12 +796,14 @@ impl Paragraph {
 
         // 연속된 문자 사이의 갭
         for i in 0..offsets.len().saturating_sub(1) {
-            if positions.len() >= total_controls {
+            if positions.len() >= slot_count {
                 break;
             }
             let current_off = offsets[i] as usize;
             let next_off = offsets[i + 1] as usize;
-            let char_width = if chars.get(i).map_or(false, |&c| c as u32 > 0xFFFF) {
+            let char_width = if chars.get(i) == Some(&'\t') {
+                8
+            } else if chars.get(i).map_or(false, |&c| c as u32 > 0xFFFF) {
                 2
             } else {
                 1
@@ -784,7 +812,7 @@ impl Paragraph {
                 let gap = next_off - current_off - char_width;
                 let n_ctrls = gap / 8;
                 for _ in 0..n_ctrls {
-                    if positions.len() >= total_controls {
+                    if positions.len() >= slot_count {
                         break;
                     }
                     positions.push(i + 1); // 현재 문자 다음에 삽입
@@ -793,11 +821,11 @@ impl Paragraph {
         }
 
         // 마지막 문자 이후의 컨트롤 (드문 경우)
-        while positions.len() < total_controls {
+        while positions.len() < slot_count {
             positions.push(chars.len());
         }
 
-        positions
+        map_positions(positions)
     }
 
     /// [start_char_offset, end_char_offset) 범위에 new_char_shape_id를 적용한다.
