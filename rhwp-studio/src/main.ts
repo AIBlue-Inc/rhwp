@@ -58,18 +58,23 @@ import {
 } from '@/view/render-backend';
 import { calculateFitPageZoom, calculateFitWidthZoom } from '@/view/zoom-fit';
 import { installEmbedRuntime } from '@/embed/runtime';
+import { installHtatisBridge } from '@/rhwp-api-bridge';
 import type { EmbedRendererRuntimeRequestV1 } from '@/embed/rpc-router';
 
 const wasm = new WasmBridge();
 const eventBus = new EventBus();
 const documentState = new DocumentDirtyState(eventBus);
-documentState.installBeforeUnload(window);
+const uninstallBeforeUnload = documentState.installBeforeUnload(window);
 const autosaveManager = new AutosaveManager({
   exportBytes: () => wasm.exportHwp(),
   schedule: autosaveScheduleFromUserSettings(),
   onStatus: handleAutosaveStatus,
 });
 autosaveManager.connect(eventBus);
+// [HTATIS] 호스트 브리지가 요청을 받기 시작하면 저장은 호스트 책임이다 — 자동저장 초안·복구·
+// beforeunload 경고·최근 문서 기록을 끈다(installHtatisBridge 의 enterHostMode).
+const HOST_MANAGED_AUTOSAVE = { recoveryEnabled: false, idleEnabled: false } as const;
+let hostManagedPersistence = false;
 initThemeSync((effective, mode) => {
   eventBus.emit('theme-changed', { mode, effective });
   eventBus.emit('command-state-changed');
@@ -785,7 +790,9 @@ function setupEventListeners(): void {
   });
 
   eventBus.on('autosave-settings-changed', () => {
-    autosaveManager.updateSchedule(autosaveScheduleFromUserSettings());
+    autosaveManager.updateSchedule(
+      hostManagedPersistence ? HOST_MANAGED_AUTOSAVE : autosaveScheduleFromUserSettings(),
+    );
   });
 
   // 필드 정보 표시
@@ -1100,7 +1107,13 @@ async function loadBytes(
   fileName: string,
   fileHandle: typeof wasm.currentFileHandle,
   startTime = performance.now(),
-  options: { dataReadProgressShown?: boolean; skipRecent?: boolean; suppressDialogs?: boolean } = {},
+  options: {
+    dataReadProgressShown?: boolean;
+    skipRecent?: boolean;
+    suppressDialogs?: boolean;
+    /** [HTATIS] 파싱 직후(폰트·뷰 초기화 전) 호출 — 호스트 브리지가 이 시점에 응답한다. */
+    onParsed?: () => void;
+  } = {},
 ): Promise<void> {
   if (!options.dataReadProgressShown) {
     await updateLoadProgress(0, '문서 데이터 준비 중...');
@@ -1108,6 +1121,7 @@ async function loadBytes(
   await updateLoadProgress(25, '문서 파싱 및 쪽 계산 중...');
   const docInfo = await loadDocumentForOpen(data, fileName);
   prepareCanvasRendererDocument();
+  options.onParsed?.();
   await updateLoadProgress(45, '자동 저장 준비 중...');
   forgetConvertedHmlSaveHandle(fileHandle);
   wasm.currentFileHandle = fileHandle;
@@ -1214,10 +1228,11 @@ async function offerAutosaveRecoveryIfIdle(): Promise<void> {
   try {
     const drafts = (await listAutosaveDrafts()).filter((draft) => draft.data.byteLength > 0);
     if (drafts.length === 0) return;
-    if (wasm.pageCount > 0 || documentState.isDirty()) return;
+    if (wasm.pageCount > 0 || documentState.isDirty() || hostManagedPersistence) return;
 
     const choice = await showAutosaveRecoveryDialog(drafts);
-    if (choice.action === 'later') return;
+    // [HTATIS] 대화상자가 떠 있는 동안 호스트가 문서를 열었으면 복구본으로 덮어쓰지 않는다.
+    if (choice.action === 'later' || hostManagedPersistence) return;
     if (choice.action === 'delete-all') {
       await clearAutosaveDrafts();
       showToast({ message: '복구 후보를 삭제했습니다.', durationMs: 2200 });
@@ -1438,6 +1453,51 @@ function showLoadError(error: unknown): void {
 }
 
 const initPromise = initialize();
+
+// [HTATIS] 호스트 브리지는 embed runtime 보다 먼저 설치한다 — 같은 legacy `rhwp-request` 를
+// 먼저 받아 처리해야 embed runtime 이 `Unknown method` 로 한 번 더 응답하지 않는다.
+let hostDocumentInit: Promise<void> = Promise.resolve();
+installHtatisBridge({
+  hostWindow: window,
+  parentWindow: window.parent,
+  wasm,
+  eventBus,
+  enterHostMode() {
+    hostManagedPersistence = true;
+    uninstallBeforeUnload();
+    autosaveManager.updateSchedule(HOST_MANAGED_AUTOSAVE);
+    void autosaveManager.discardCurrentDraft('host-managed');
+  },
+  async loadDocument(data, fileName) {
+    await initPromise;
+    // 앞선 문서의 초기화(폰트·뷰)가 끝난 뒤에 다음 문서를 연다.
+    await hostDocumentInit;
+    return new Promise((resolve, reject) => {
+      let parsed = false;
+      const reply = () => resolve({ pageCount: wasm.pageCount });
+      // 0.7.8 브리지처럼 파싱이 끝나면 응답한다 — 웹폰트 다운로드가 호스트 요청 타임아웃을 넘기지 않게.
+      hostDocumentInit = loadBytes(data, fileName, null, undefined, {
+        suppressDialogs: true,
+        skipRecent: true,
+        onParsed: () => {
+          parsed = true;
+          reply();
+        },
+      }).then(
+        () => {
+          if (!parsed) reply();
+        },
+        (error) => {
+          if (parsed) console.error('[htatis-bridge] 문서 초기화 실패', error);
+          else reject(error);
+        },
+      );
+    });
+  },
+  refreshDocumentView: () => canvasView?.refreshPages(),
+  getCanvasView: () => canvasView,
+  getInputHandler: () => inputHandler,
+});
 
 installEmbedRuntime({
   hostWindow: window,
