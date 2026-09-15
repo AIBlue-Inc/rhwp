@@ -3413,6 +3413,42 @@ impl HwpDocument {
         .map_err(|e| e.into())
     }
 
+    /// [HTATIS] 기존 문단에 떠 있는 그림을 추가한다 — 문단을 새로 만들지 않는다.
+    ///
+    /// `props_json` 생략 시 용지 기준·글 앞으로 배치. 형식은 `setPictureProperties` 와 같다.
+    /// 반환: JSON `{"ok":true,"paraIdx":<호스트 문단>,"controlIdx":<새 컨트롤>}`
+    #[wasm_bindgen(js_name = insertPictureInParagraph)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_picture_in_paragraph(
+        &mut self,
+        section_idx: u32,
+        para_idx: u32,
+        char_offset: u32,
+        image_data: &[u8],
+        width: u32,
+        height: u32,
+        natural_width_px: u32,
+        natural_height_px: u32,
+        extension: &str,
+        description: &str,
+        props_json: Option<String>,
+    ) -> Result<String, JsValue> {
+        self.insert_picture_in_paragraph_native(
+            section_idx as usize,
+            para_idx as usize,
+            char_offset as usize,
+            image_data,
+            width,
+            height,
+            natural_width_px,
+            natural_height_px,
+            extension,
+            description,
+            props_json.as_deref().unwrap_or(""),
+        )
+        .map_err(|e| e.into())
+    }
+
     /// 커서 위치에 그림을 삽입한다 (확장, options object — #1413).
     ///
     /// positional `insertPicture` 와 동일 동작의 얇은 어댑터. 이미지 바이너리는 별도
