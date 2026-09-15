@@ -458,6 +458,8 @@ impl DocumentCore {
         control_idx: usize,
         props_json: &str,
     ) -> Result<String, HwpError> {
+        // [HTATIS] 숫자 속성은 변경 전에 검증 — 실패 시 문서 무변경.
+        Self::validate_picture_numeric_props(props_json)?;
         // JSON 파싱 (serde_json 사용 대신 수동 파싱 — 기존 패턴)
         // [Task #825] 픽쳐 속성 mutation 은 helper 로 분리 (머리말/꼬리말 path 와 공유).
         let (
@@ -1218,14 +1220,22 @@ impl DocumentCore {
             )));
         }
         // 그림 컨트롤인지 확인
-        if !matches!(
-            &para.controls[control_idx],
-            crate::model::control::Control::Picture(_)
-        ) {
-            return Err(HwpError::RenderError(
-                "지정된 컨트롤이 그림이 아닙니다".to_string(),
-            ));
-        }
+        let affects_line_layout = match &para.controls[control_idx] {
+            // [HTATIS] 글 앞/뒤로 배치한 떠 있는 그림은 줄 높이·흐름에 관여하지 않는다.
+            crate::model::control::Control::Picture(pic) => {
+                pic.common.treat_as_char
+                    || !matches!(
+                        pic.common.text_wrap,
+                        crate::model::shape::TextWrap::InFrontOfText
+                            | crate::model::shape::TextWrap::BehindText
+                    )
+            }
+            _ => {
+                return Err(HwpError::RenderError(
+                    "지정된 컨트롤이 그림이 아닙니다".to_string(),
+                ))
+            }
+        };
 
         // 컨트롤이 차지하는 갭의 시작 위치를 찾아 char_offsets 조정
         let text_chars: Vec<char> = para.text.chars().collect();
@@ -1274,6 +1284,30 @@ impl DocumentCore {
                     *offset -= 8;
                 }
             }
+            // [HTATIS] 삽입(shift_for_inline_control_insert)이 함께 민 좌표를 되돌린다 —
+            // 안 그러면 삭제 뒤 글자모양 경계·줄 시작·범위 태그가 8 만큼 뒤에 남는다.
+            // 삽입은 char_offsets 가 빈 문단(컨트롤만 있는 문단)을 밀지 않으므로 여기서도 건너뛴다.
+            if !para.char_offsets.is_empty() {
+                for cs in &mut para.char_shapes {
+                    if cs.start_pos >= threshold {
+                        cs.start_pos -= 8;
+                    }
+                }
+                for seg in &mut para.line_segs {
+                    if seg.text_start >= threshold {
+                        seg.text_start -= 8;
+                    }
+                }
+                for rt in &mut para.range_tags {
+                    if rt.start >= threshold {
+                        rt.start -= 8;
+                    }
+                    if rt.end >= threshold {
+                        rt.end -= 8;
+                    }
+                }
+                para.invalidate_single_line_overflow_memo();
+            }
         }
 
         // 컨트롤 및 ctrl_data_record 제거
@@ -1288,7 +1322,10 @@ impl DocumentCore {
         }
 
         // line_segs 재계산: 그림 높이가 반영된 line_segs를 텍스트 기반으로 리셋
-        Self::reflow_paragraph_line_segs_after_control_delete(para, &self.styles, self.dpi);
+        // [HTATIS] 줄 배치에 관여하지 않는 떠 있는 그림은 저장된 줄 나눔을 그대로 둔다.
+        if affects_line_layout {
+            Self::reflow_paragraph_line_segs_after_control_delete(para, &self.styles, self.dpi);
+        }
 
         section.raw_stream = None;
         self.recompose_section(section_idx);
@@ -1381,6 +1418,9 @@ impl DocumentCore {
             }
         }
 
+        // [HTATIS] 원본 크기 검증은 BinData 등록 전에 — px × 75 overflow 방지.
+        let (crop_right, crop_bottom) =
+            Self::picture_natural_extent_hu(natural_width_px, natural_height_px)?;
         let position_id = self.register_embedded_bin_data(image_data, extension);
 
         {
@@ -1408,8 +1448,8 @@ impl DocumentCore {
             pic.crop = crate::model::image::CropInfo {
                 left: 0,
                 top: 0,
-                right: (natural_width_px * 75) as i32,
-                bottom: (natural_height_px * 75) as i32,
+                right: crop_right,
+                bottom: crop_bottom,
             };
         }
 
@@ -1522,6 +1562,11 @@ impl DocumentCore {
             false
         };
 
+        // [HTATIS] 크기 검증은 BinData 등록 전에 — 곱셈 overflow 로 crop/imgDim 이 wrap
+        // 되거나, 실패한 삽입이 BinData 만 남기지 않게 한다.
+        let (crop_right, crop_bottom) =
+            Self::validated_picture_extent(width, height, natural_width_px, natural_height_px)?;
+
         // --- 1·2. BinData 등록 (콘텐츠 + 메타데이터) ---
         // [Task #2230] 그림 지정(assign_picture_image_native)과 규칙 공유를 위해
         // register_embedded_bin_data 로 추출.
@@ -1543,8 +1588,8 @@ impl DocumentCore {
         let crop = CropInfo {
             left: 0,
             top: 0,
-            right: (natural_width_px * 75) as i32,
-            bottom: (natural_height_px * 75) as i32,
+            right: crop_right,
+            bottom: crop_bottom,
         };
         // [#3719 §6-5] crop 이 기준으로 삼는 전체 좌표 범위를 IR 에도 남긴다.
         //
@@ -1559,7 +1604,7 @@ impl DocumentCore {
         // 는 imgDim 이 없으면 crop.right/bottom 을 같은 자리에 쓴다)과도 같은 배율이라
         // 그림이 놓이는 결과는 바뀌지 않는다. HWPX 산출은 종전 `imgDim 0/0` 대신 실제
         // 좌표 범위를 얻는다(HWP5 산출과의 비대칭 해소).
-        let img_dim = ((natural_width_px * 75), (natural_height_px * 75));
+        let img_dim = (crop_right as u32, crop_bottom as u32);
         let image_attr = ImageAttr {
             bin_data_id: position_id,
             brightness: 0,
@@ -1815,6 +1860,217 @@ impl DocumentCore {
         Ok(crate::document_core::helpers::json_ok_with(&format!(
             "\"paraIdx\":{},\"controlIdx\":{},\"logicalOffset\":{}",
             para_idx, new_ctrl_idx, logical_after
+        )))
+    }
+
+    /// [HTATIS] 그림 속성 JSON 의 숫자 키를 **변경 전에** 검증한다.
+    ///
+    /// `json_u32`/`json_i32` 는 읽을 수 없는 값(`0.5`, 범위 초과, 음수 크기)을 `None` 으로
+    /// 삼키거나 앞자리만 읽는다 — 호출자는 성공 응답을 받는데 값은 반영되지 않는다.
+    /// 같은 `"key":` 패턴만 검사해 "검증 통과 = 실제 적용" 을 맞춘다.
+    /// 오프셋은 upstream 규약대로 부호 있는 HWPUNIT 이다(#1282 회전 그림의 음수 오프셋).
+    fn validate_picture_numeric_props(props_json: &str) -> Result<(), HwpError> {
+        const I32_MIN: i64 = i32::MIN as i64;
+        const I32_MAX: i64 = i32::MAX as i64;
+        for (key, min, max) in [
+            ("width", 1, I32_MAX),
+            ("height", 1, I32_MAX),
+            ("vertOffset", I32_MIN, I32_MAX),
+            ("horzOffset", I32_MIN, I32_MAX),
+        ] {
+            let pattern = format!("\"{}\":", key);
+            for (pos, _) in props_json.match_indices(&pattern) {
+                let token = props_json[pos + pattern.len()..]
+                    .trim_start()
+                    .split([',', '}'])
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if !token.parse::<i64>().is_ok_and(|v| (min..=max).contains(&v)) {
+                    return Err(HwpError::RenderError(format!(
+                        "E_INVALID: {} must be an integer in {}..={}",
+                        key, min, max
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// [HTATIS] 원본 픽셀 크기 → crop 좌표 범위(HWPUNIT@96dpi = px × 75).
+    ///
+    /// 곱셈이 i32 를 넘으면 crop/imgDim 이 조용히 wrap 되어 그림이 깨진다.
+    /// BinData 를 등록하기 **전에** 호출해 실패 시 문서를 건드리지 않는다.
+    fn picture_natural_extent_hu(
+        natural_width_px: u32,
+        natural_height_px: u32,
+    ) -> Result<(i32, i32), HwpError> {
+        let units = |px: u32| {
+            px.checked_mul(75)
+                .filter(|&hu| px > 0 && hu <= i32::MAX as u32)
+                .map(|hu| hu as i32)
+        };
+        match (units(natural_width_px), units(natural_height_px)) {
+            (Some(w), Some(h)) => Ok((w, h)),
+            _ => Err(HwpError::RenderError(format!(
+                "E_INVALID: natural image size must be in 1..={}px",
+                i32::MAX as u32 / 75
+            ))),
+        }
+    }
+
+    /// [HTATIS] 표시 크기와 원본 크기를 함께 검증한다 — 두 삽입 API 공용.
+    fn validated_picture_extent(
+        width: u32,
+        height: u32,
+        natural_width_px: u32,
+        natural_height_px: u32,
+    ) -> Result<(i32, i32), HwpError> {
+        if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
+            return Err(HwpError::RenderError(format!(
+                "E_INVALID: picture width/height must be in 1..={}",
+                i32::MAX
+            )));
+        }
+        Self::picture_natural_extent_hu(natural_width_px, natural_height_px)
+    }
+
+    /// [HTATIS] 기존 문단에 떠 있는 그림을 추가한다 — 문단을 새로 만들지 않는다.
+    ///
+    /// 직인처럼 이미 있는 글자(`(인)`) 위에 이미지를 겹칠 때 쓴다. 호스트 문단의 텍스트와
+    /// 구역의 문단 수는 그대로이고, 그림은 `char_offset`(글자 인덱스) 자리의 확장 컨트롤
+    /// 갭으로 들어간다 — 본문 분기(`insert_picture_native`)와 같은 좌표 규약(#4347).
+    ///
+    /// 기본 배치는 용지 기준·글 앞으로·오프셋 0 인 떠 있는 개체다. `props_json` 은
+    /// `set_picture_properties_native` 가 받는 형식이며 **그 함수로** 적용한다(글자처럼
+    /// 취급 전환·캡션 번호 같은 후처리까지 속성 변경과 동일).
+    ///
+    /// 반환: `{"ok":true,"paraIdx":<호스트 문단>,"controlIdx":<새 컨트롤>}`. 같은 글자
+    /// 위치의 기존 컨트롤 뒤에 들어가며, 그보다 뒤에 있던 컨트롤 인덱스는 1 씩 밀린다.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_picture_in_paragraph_native(
+        &mut self,
+        section_idx: usize,
+        para_idx: usize,
+        char_offset: usize,
+        image_data: &[u8],
+        width: u32,
+        height: u32,
+        natural_width_px: u32,
+        natural_height_px: u32,
+        extension: &str,
+        description: &str,
+        props_json: &str,
+    ) -> Result<String, HwpError> {
+        use crate::model::image::{CropInfo, ImageAttr, ImageEffect, Picture};
+        use crate::model::shape::{
+            CommonObjAttr, HorzRelTo, ShapeComponentAttr, TextWrap, VertRelTo,
+        };
+
+        // 검증은 모두 BinData 등록 전에 — 실패하면 문서를 건드리지 않는다.
+        let para = self
+            .document
+            .sections
+            .get(section_idx)
+            .ok_or_else(|| HwpError::RenderError(format!("구역 인덱스 {} 범위 초과", section_idx)))?
+            .paragraphs
+            .get(para_idx)
+            .ok_or_else(|| HwpError::RenderError(format!("문단 인덱스 {} 범위 초과", para_idx)))?;
+        if char_offset > para.text.chars().count() {
+            return Err(HwpError::RenderError(format!(
+                "문자 인덱스 {} 범위 초과",
+                char_offset
+            )));
+        }
+        if image_data.is_empty() {
+            return Err(HwpError::RenderError(
+                "이미지 데이터가 비어 있습니다".to_string(),
+            ));
+        }
+        Self::validate_picture_numeric_props(props_json)?;
+        let (crop_right, crop_bottom) =
+            Self::validated_picture_extent(width, height, natural_width_px, natural_height_px)?;
+
+        let position_id = self.register_embedded_bin_data(image_data, extension);
+        let mut common = CommonObjAttr {
+            ctrl_id: 0x67736F20, // "gso " — GenShape
+            // bits 15-17=width_criterion(4=Absolute), bits 18-20=height_criterion(2=Absolute)
+            attr: (4 << 15) | (2 << 18),
+            treat_as_char: false,
+            vert_rel_to: VertRelTo::Paper,
+            horz_rel_to: HorzRelTo::Paper,
+            text_wrap: TextWrap::InFrontOfText,
+            width,
+            height,
+            z_order: 1,
+            description: description.to_string(),
+            ..Default::default()
+        };
+        // 배치 enum 과 packed attr 을 맞춘다 — 낡으면 HWP 저장이 옛 배치를 되살린다.
+        // 크기 기준(bits 15-20)은 위 리터럴 그대로 두고 앵커·배치 비트만 되쓴다.
+        crate::serializer::control::sync_anchor_bits(&mut common);
+        crate::serializer::control::sync_text_wrap_bits(&mut common);
+        let pic = Picture {
+            common,
+            shape_attr: ShapeComponentAttr {
+                original_width: width,
+                original_height: height,
+                current_width: width,
+                current_height: height,
+                local_file_version: 1,
+                render_sx: 1.0,
+                render_sy: 1.0,
+                ..Default::default()
+            },
+            border_x: [0, 0, width as i32, 0],
+            border_y: [width as i32, height as i32, 0, height as i32],
+            crop: CropInfo {
+                left: 0,
+                top: 0,
+                right: crop_right,
+                bottom: crop_bottom,
+            },
+            img_dim: (crop_right as u32, crop_bottom as u32),
+            image_attr: ImageAttr {
+                bin_data_id: position_id,
+                brightness: 0,
+                contrast: 0,
+                effect: ImageEffect::RealPic,
+                transparency: 0,
+                external_path: None,
+            },
+            ..Default::default()
+        };
+
+        self.document.sections[section_idx].raw_stream = None;
+        let parent = &mut self.document.sections[section_idx].paragraphs[para_idx];
+        let control_idx = Self::control_insert_index(parent, char_offset);
+        parent.align_ctrl_data_records();
+        parent
+            .controls
+            .insert(control_idx, Control::Picture(Box::new(pic)));
+        parent.ctrl_data_records.insert(control_idx, None);
+        // 문단 끝 문자 1칸은 항상 있다 — 기본값(0) 문단에도 갭을 더하기 전에 맞춘다.
+        parent.char_count = parent.char_count.max(1);
+        Self::leave_coordinate_trace(parent, char_offset);
+        parent.control_mask |= 0x0000_0800;
+        parent.has_para_text = true;
+
+        self.mark_section_dirty(section_idx);
+        self.paginate_if_needed();
+        self.invalidate_page_tree_cache();
+        self.event_log.push(DocumentEvent::PictureInserted {
+            section: section_idx,
+            para: para_idx,
+        });
+
+        let props = props_json.trim();
+        if !props.is_empty() && props != "{}" {
+            self.set_picture_properties_native(section_idx, para_idx, control_idx, props_json)?;
+        }
+        Ok(crate::document_core::helpers::json_ok_with(&format!(
+            "\"paraIdx\":{},\"controlIdx\":{}",
+            para_idx, control_idx
         )))
     }
 }
