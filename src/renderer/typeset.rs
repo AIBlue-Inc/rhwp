@@ -3239,6 +3239,22 @@ fn preceding_stored_vpos(paragraphs: &[Paragraph], para_idx: usize) -> Option<i3
         })
 }
 
+/// 앞 문단이 저장 flow 에서 끝난 바닥(vpos + line_height). `preceding_stored_vpos` 와 같은
+/// 탐색이지만 시작이 아니라 끝을 본다 — 쪽을 가득 채운 표처럼 vpos 가 0 에서 시작하는 항목도
+/// "이 쪽은 이미 찼다" 를 표현할 수 있어야 한다.
+fn preceding_stored_bottom(paragraphs: &[Paragraph], para_idx: usize) -> Option<i32> {
+    paragraphs[..para_idx.min(paragraphs.len())]
+        .iter()
+        .rev()
+        .find_map(|p| {
+            p.line_segs
+                .iter()
+                .rev()
+                .find(|s| !is_synthetic_line_seg(s))
+                .map(|s| s.vertical_pos.saturating_add(s.line_height))
+        })
+}
+
 fn paragraph_forces_page_boundary_after(
     current_para: &Paragraph,
     next_para: &Paragraph,
@@ -14844,23 +14860,37 @@ impl TypesetEngine {
         // 258 vs 242)을 만든다. 다음 문단이 새 페이지를 시작(vpos-reset)하므로 tail 을 현재
         // 페이지에 두는 것이 한글 정합. (실제 각주 높이는 유지 — 버퍼만 완화하여 겹침 위험 최소화;
         // 버퍼 초과분은 별도 원인이라 여기서 다루지 않는다.)
-        let footnote_margin_addback = if strict_after_empty_host_float {
-            st.skip_footnote_margin_once = false;
-            0.0
-        } else if st.skip_footnote_margin_once {
-            st.skip_footnote_margin_once = false;
-            if st.current_footnote_height > 0.0 {
-                st.footnote_safety_margin
+        // [#4517] 저장 LINE_SEG 가 이 문단을 새 쪽 첫 줄로 기록했으면(직전 문단이 쪽을 채운 뒤
+        // vpos 가 0 으로 되돌아감) tail 완화(각주 버퍼·소량 오버플로 허용)를 적용하지 않는다.
+        // 완화는 "쪽 마지막 줄" 용인데, 표처럼 완화를 소비하지 않는 문단을 건너뛰면 1회 허용치가
+        // 다음 쪽 첫 줄까지 살아남아 본문 하단 밖에 배치된다(거제 공고 pi=99: 표 866.6px 뒤
+        // 제목 16px 가 본문 876.9px 를 넘겨 같은 쪽에 놓임 — 한글은 다음 쪽 첫 줄).
+        let stored_page_start_after_full_page = st.col_count == 1
+            && para
+                .line_segs
+                .iter()
+                .find(|ls| !is_synthetic_line_seg(ls))
+                .map(|ls| ls.vertical_pos == 0)
+                .unwrap_or(false)
+            && preceding_stored_bottom(paragraphs, para_idx).is_some_and(|bottom| bottom > 5000);
+        let footnote_margin_addback =
+            if strict_after_empty_host_float || stored_page_start_after_full_page {
+                st.skip_footnote_margin_once = false;
+                0.0
+            } else if st.skip_footnote_margin_once {
+                st.skip_footnote_margin_once = false;
+                if st.current_footnote_height > 0.0 {
+                    st.footnote_safety_margin
+                } else {
+                    0.0
+                }
             } else {
                 0.0
-            }
-        } else {
-            0.0
-        };
+            };
         // [Task #1725 v2] tail-before-vpos-reset 문단은 소량 오버플로를 1회 허용(각주 무관 page-full
         // over-fill 로 tail 이 밀리는 케이스). 다음 문단이 새 페이지를 시작하므로 tail 을 현재
         // 페이지 하단에 유지하는 것이 한글 정합.
-        let tail_overflow = if strict_after_empty_host_float {
+        let tail_overflow = if strict_after_empty_host_float || stored_page_start_after_full_page {
             st.tail_overflow_tolerance_once = 0.0;
             0.0
         } else if st.tail_overflow_tolerance_once > 0.0 {
@@ -23512,6 +23542,48 @@ mod tests {
             shapes_per_page,
             vec![2],
             "2장 스택은 쪽 이월 없이 현재 쪽을 유지해야 한다",
+        );
+    }
+
+    /// [#4517] `preceding_stored_bottom` 은 앞 문단이 저장 flow 에서 끝난 **바닥**을 읽는다.
+    ///
+    /// 쪽을 가득 채운 표는 `vpos=0` 에서 시작하므로 시작값만 보는 `preceding_stored_vpos`
+    /// 로는 "이 쪽은 이미 찼다" 를 알 수 없다. 그래서 그 뒤에 오는 `vpos=0` 문단(= 저장본이
+    /// 새 쪽 첫 줄로 기록한 줄)에 tail 완화가 잘못 붙었다.
+    #[test]
+    fn issue4517_preceding_stored_bottom_reads_full_page_item_end() {
+        let stored = |vpos: i32, line_height: i32, tag: u32| Paragraph {
+            line_segs: vec![LineSeg {
+                vertical_pos: vpos,
+                line_height,
+                tag,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let paras = vec![stored(0, 64_996, 0), stored(0, 1_200, 0)];
+
+        assert_eq!(
+            preceding_stored_bottom(&paras, 1),
+            Some(64_996),
+            "쪽을 채운 앞 항목의 끝을 읽어야 한다"
+        );
+        assert_eq!(
+            preceding_stored_vpos(&paras, 1),
+            Some(0),
+            "시작값만 보면 쪽이 찼는지 알 수 없다 — 이 차이가 #4517 의 원인이다"
+        );
+        assert_eq!(
+            preceding_stored_bottom(&paras, 0),
+            None,
+            "앞 문단이 없으면 None"
+        );
+
+        let synthetic = vec![stored(0, 64_996, 0x8000_0000), stored(0, 1_200, 0)];
+        assert_eq!(
+            preceding_stored_bottom(&synthetic, 1),
+            None,
+            "합성 세그먼트는 저장 증거가 아니다"
         );
     }
 
