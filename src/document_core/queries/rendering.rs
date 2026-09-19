@@ -2485,6 +2485,58 @@ impl DocumentCore {
         Ok(format!("{{\"ok\":true,\"pageCount\":{}}}", page_count))
     }
 
+    /// [htatis] 구역 하나를 통째로 지운다 (네이티브 에러 타입).
+    ///
+    /// 문단 삭제는 구역의 마지막 문단을 지울 수 없어, 쪽 범위 밖 구역이 빈 문단 하나(빈 쪽 1장)로
+    /// 남았다(HTATIS 서식 쪽 자르기, 강진·단양 공고문). 구역 인덱스로 짝지어진 상태는 지운 구역
+    /// 자리를 함께 빼서 뒤 구역과 어긋나지 않게 하고, 파생 상태는 `rebuild_derived_state` 로 전부
+    /// 원본에서 다시 만든다. 문서 속성의 구역 개수는 DocInfo 원본 바이트에도 반영한다(원본 그대로
+    /// 직렬화되는 경우).
+    pub fn delete_section_native(&mut self, section_idx: usize) -> Result<String, HwpError> {
+        let count = self.document.sections.len();
+        if section_idx >= count {
+            return Err(HwpError::RenderError(format!(
+                "구역 인덱스 {} 범위 초과 (총 {}개)",
+                section_idx, count
+            )));
+        }
+        if count <= 1 {
+            return Err(HwpError::RenderError(
+                "문서의 마지막 구역은 삭제할 수 없습니다".to_string(),
+            ));
+        }
+        // DocInfo 원본 바이트를 먼저 고친다 — 실패하면 문서를 건드리지 않은 채 끝난다.
+        let remaining = (count - 1) as u16;
+        if !self.document.doc_info.raw_stream_dirty {
+            if let Some(raw) = self.document.doc_info.raw_stream.as_mut() {
+                crate::serializer::doc_info::surgical_update_section_count(raw, remaining)
+                    .map_err(HwpError::RenderError)?;
+            }
+        }
+        self.document.doc_properties.section_count = remaining;
+        self.document.sections.remove(section_idx);
+        fn drop_at<T>(items: &mut Vec<T>, index: usize) {
+            if index < items.len() {
+                items.remove(index);
+            }
+        }
+        drop_at(&mut self.pagination, section_idx);
+        drop_at(&mut self.dirty_sections, section_idx);
+        drop_at(&mut self.para_offset, section_idx);
+        drop_at(
+            &mut self.render_normalization.section_revisions,
+            section_idx,
+        );
+        self.active_field = None;
+
+        self.rebuild_derived_state();
+        let page_count = self.page_count();
+        Ok(format!(
+            "{{\"ok\":true,\"sectionCount\":{},\"pageCount\":{}}}",
+            remaining, page_count
+        ))
+    }
+
     /// 모든 구역의 SectionDef를 일괄 변경하고 재페이지네이션 (네이티브 에러 타입)
     pub fn set_section_def_all_native(&mut self, json: &str) -> Result<String, HwpError> {
         let count = self.document.sections.len();
