@@ -587,8 +587,33 @@ fn serialize_table_record(table: &Table) -> Vec<u8> {
     let mut w = ByteWriter::new();
 
     // attr (원본이 있으면 그대로, 없으면 재구성)
+    // [htatis] 원본 attr 을 그대로 쓰면 setTableProperties 로 바꾼 「쪽 경계에서 나눔」(bit 0-1)·
+    // 「제목 줄 반복」(bit 2) 이 저장본에서 사라졌다. 모델 값이 원본 비트와 다를 때만 그 비트를 바꾼다
+    // (원본 3 = 셀 단위처럼 모델로 같게 읽히는 값은 그대로 보존).
     let attr = if table.raw_table_record_attr != 0 {
-        table.raw_table_record_attr
+        let raw = table.raw_table_record_attr;
+        let raw_page_break = match raw & 0x03 {
+            1 | 3 => TablePageBreak::CellBreak,
+            2 => TablePageBreak::RowBreak,
+            _ => TablePageBreak::None,
+        };
+        let mut a = raw;
+        if raw_page_break != table.page_break {
+            a &= !0x03;
+            match table.page_break {
+                TablePageBreak::CellBreak => a |= 0x01,
+                TablePageBreak::RowBreak => a |= 0x02,
+                TablePageBreak::None => {}
+            }
+        }
+        if (raw & 0x04 != 0) != table.repeat_header {
+            if table.repeat_header {
+                a |= 0x04;
+            } else {
+                a &= !0x04;
+            }
+        }
+        a
     } else {
         let mut a: u32 = 0;
         match table.page_break {
