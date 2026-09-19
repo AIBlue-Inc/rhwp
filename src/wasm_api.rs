@@ -1055,6 +1055,15 @@ impl HwpDocument {
             .map_err(|e| e.into())
     }
 
+    /// [htatis] 구역 하나를 통째로 지우고 재페이지네이션한다.
+    ///
+    /// 반환: JSON `{"ok":true,"sectionCount":<n>,"pageCount":<n>}`. 마지막 남은 구역은 지울 수 없다.
+    #[wasm_bindgen(js_name = deleteSection)]
+    pub fn delete_section(&mut self, section_idx: u32) -> Result<String, JsValue> {
+        self.delete_section_native(section_idx as usize)
+            .map_err(|e| e.into())
+    }
+
     /// 모든 구역의 SectionDef를 일괄 변경하고 재페이지네이션한다.
     #[wasm_bindgen(js_name = setSectionDefAll)]
     pub fn set_section_def_all(&mut self, json: &str) -> Result<String, JsValue> {

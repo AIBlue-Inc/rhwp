@@ -860,6 +860,29 @@ pub fn surgical_remove_records(raw_stream: &mut Vec<u8>, tag_id: u16) -> usize {
     removed
 }
 
+/// [htatis] DocInfo raw_stream 내 DOCUMENT_PROPERTIES 레코드의 구역 개수(offset 0-1)만 갱신한다.
+///
+/// 구역을 지운 뒤 raw_stream 을 그대로 쓰면 구역 개수가 실제 BodyText/Section 스트림 수와 어긋난다.
+pub fn surgical_update_section_count(
+    raw_stream: &mut Vec<u8>,
+    section_count: u16,
+) -> Result<(), String> {
+    let positions = scan_records(raw_stream);
+    let doc_props_pos = positions
+        .iter()
+        .find(|r| r.tag_id == tags::HWPTAG_DOCUMENT_PROPERTIES)
+        .ok_or_else(|| "DOCUMENT_PROPERTIES 레코드를 찾을 수 없음".to_string())?;
+    if doc_props_pos.data_size < 2 {
+        return Err(format!(
+            "DOCUMENT_PROPERTIES 데이터 크기 부족: {} < 2",
+            doc_props_pos.data_size
+        ));
+    }
+    let data_off = doc_props_pos.data_offset;
+    raw_stream[data_off..data_off + 2].copy_from_slice(&section_count.to_le_bytes());
+    Ok(())
+}
+
 /// DocInfo raw_stream 내 DOCUMENT_PROPERTIES 레코드의 캐럿 위치만 갱신한다.
 ///
 /// raw_stream 전체를 재직렬화하지 않고, 캐럿 위치 3필드(12바이트)만 in-place 수정.
