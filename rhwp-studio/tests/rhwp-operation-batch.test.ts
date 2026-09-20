@@ -341,3 +341,28 @@ test('native E_INVALID errors propagate through the operation bridge', async () 
   assert.equal(result.ok, false);
   assert.match(String(result.applied[0].error), /E_INVALID/);
 });
+
+test('copyCellFormat resolves the source by row/col and copies paragraph and character appearance', async () => {
+  const f = fixture();
+  const calls: unknown[][] = [];
+  Object.assign(f.wasm, {
+    getCellProperties: (...args: number[]) => { calls.push(['get', args[3]]); return { width: 100 + args[3] }; },
+    setCellProperties: (...args: unknown[]) => { calls.push(['set', args[3], args[4]]); return { ok: true }; },
+    getCellCharPropertiesAt: (...args: number[]) => ({ from: args[3], para: args[4] }),
+    getCellParaPropertiesAt: (...args: number[]) => ({ from: args[3], para: args[4] }),
+    applyParaFormatInCell: (...args: unknown[]) => { calls.push(['para', args[3], args[4], args[5]]); return json({ ok: true }); },
+    applyCharFormatInCell: (...args: unknown[]) => { calls.push(['char', args[3], args[4], args[5], args[6], args[7]]); return json({ ok: true }); },
+  });
+  // cell 1 is (row 2, col 3); without source_row/source_col support the source silently became cell 0.
+  const result = await f.applyOperationBatch([{ op: 'copyCellFormat', sec: 0, para: 0, ci: 0,
+    source_row: 2, source_col: 3, row: 0, col: 0 }]);
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, [['get', 1], ['set', 0, { width: 101 }],
+    ['para', 0, 0, '{"from":1,"para":0}'], ['char', 0, 0, 0, 5, '{"from":1,"para":0}'],
+    ['para', 0, 1, '{"from":1,"para":1}'], ['char', 0, 1, 0, 0, '{"from":1,"para":1}']]);
+  calls.length = 0;
+  const byIndex = await f.applyOperationBatch([{ op: 'copyCellFormat', sec: 0, para: 0, ci: 0,
+    source_cell_index: 1, target_cell_index: 0 }]);
+  assert.equal(byIndex.ok, true);
+  assert.deepEqual(calls, [['get', 1], ['set', 0, { width: 101 }]]);
+});

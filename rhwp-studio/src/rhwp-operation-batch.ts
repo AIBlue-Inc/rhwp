@@ -356,7 +356,8 @@ export function createOperationBridge({ wasm, rawDoc, flushPendingNow, isExplici
   refreshDocumentView, notifyChanged }: {
   wasm: Pick<WasmBridge, 'getTableDimensions' | 'getCellInfo' | 'getCellParagraphCount'
     | 'getCellParagraphLength' | 'deleteTextInCell' | 'insertTextInCell' | 'insertTableRow'
-    | 'deleteTableRow' | 'mergeTableCells' | 'getCellProperties' | 'setCellProperties' | 'setFieldValueByName'>;
+    | 'deleteTableRow' | 'mergeTableCells' | 'getCellProperties' | 'setCellProperties' | 'setFieldValueByName'
+    | 'getCellCharPropertiesAt' | 'getCellParaPropertiesAt' | 'applyParaFormatInCell' | 'applyCharFormatInCell'>;
   rawDoc: () => OperationDocument | null;
   flushPendingNow: () => void;
   isExplicitBatchOpen: () => boolean;
@@ -539,7 +540,13 @@ export function createOperationBridge({ wasm, rawDoc, flushPendingNow, isExplici
     }
 
     if (op === 'copyCellFormat') {
-      const sourceCellIndex = operation.source_cell_index as number;
+      // Keep equal to the server worker: the compiler addresses the source by
+      // source_row/source_col. Reading only source_cell_index fell back to cell 0,
+      // which copied the first header cell's width into every target cell.
+      const sourceCellIndex = resolveOperationCellIndex({
+        sec, para, ci, cell_index: operation.source_cell_index,
+        row: operation.source_row, col: operation.source_col,
+      }, cellIndexResolver);
       const targetCellIndex = resolveOperationCellIndex(
         operation,
         cellIndexResolver,
@@ -550,6 +557,26 @@ export function createOperationBridge({ wasm, rawDoc, flushPendingNow, isExplici
         wasm.setCellProperties(sec, para, ci, targetCellIndex, sourceProperties),
         `${tag} setCellProperties`,
       );
+      if (Number.isInteger(operation.source_row)) {
+        // PR-53 format copies include text/paragraph appearance, including empty
+        // insertion points, so subsequent data writes inherit the selected style.
+        const sourceCount = wasm.getCellParagraphCount(sec, para, ci, sourceCellIndex);
+        const targetCount = wasm.getCellParagraphCount(sec, para, ci, targetCellIndex);
+        for (let p = 0; p < targetCount; p++) {
+          const sourceP = Math.min(p, sourceCount - 1);
+          const charProps = wasm.getCellCharPropertiesAt(sec, para, ci, sourceCellIndex, sourceP, 0);
+          const paraProps = wasm.getCellParaPropertiesAt(sec, para, ci, sourceCellIndex, sourceP);
+          const length = wasm.getCellParagraphLength(sec, para, ci, targetCellIndex, p);
+          requireOkResult(
+            JSON.parse(wasm.applyParaFormatInCell(sec, para, ci, targetCellIndex, p, JSON.stringify(paraProps))),
+            `${tag} applyParaFormatInCell`,
+          );
+          requireOkResult(
+            JSON.parse(wasm.applyCharFormatInCell(sec, para, ci, targetCellIndex, p, 0, length, JSON.stringify(charProps))),
+            `${tag} applyCharFormatInCell`,
+          );
+        }
+      }
       return;
     }
 
